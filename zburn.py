@@ -838,7 +838,7 @@ def main(argv: list[str] | None = None) -> int:
         p.set_defaults(func=fn)
 
     gp = sub.add_parser("gateway", help="只探活/必要时启动网关")
-    gp.add_argument("--config", default=None)
+    gp.add_argument("--config", default=__import__("argparse").SUPPRESS)
     gp.set_defaults(func=cmd_gateway)
 
     sub.add_parser("token", help="生成面板 token").set_defaults(func=cmd_panel_token)
