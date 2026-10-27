@@ -1,0 +1,14 @@
+# 运行状态与日志
+.zburn/
+STOP
+*.log
+config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

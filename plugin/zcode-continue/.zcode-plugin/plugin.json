@@ -1,0 +1,10 @@
+{
+  "name": "zburn-continue",
+  "version": "1.0.0",
+  "description": "回合结束自动续派：ZCode 每结束一个回合都会触发 Stop 钩子，本插件读一次后端剩余额度，还有额度就注入一条继续指令，让 agent 接着干；额度烧完/读不到/被关掉就正常放行停止。全程不依赖窗口焦点，锁屏也能工作。",
+  "author": {
+    "name": "zburn"
+  },
+  "license": "MIT",
+  "hooks": "./hooks/hooks.json"
+}

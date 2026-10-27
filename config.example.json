@@ -1,0 +1,54 @@
+{
+  "app": {
+    "process_name": "ZCode",
+    "exe": "E:\\exe\\Zcode\\ZCode.exe",
+    "start_args": [],
+    "strip_env": ["ELECTRON_RUN_AS_NODE"],
+    "start_if_down": true
+  },
+  "uia": {
+    "send_button_regex": "发送|加入队列|立即|Send",
+    "busy_regex": "停止生成|Stop generating",
+    "queued_regex": "移除待发送消息|Remove queued",
+    "session_regex": ".",
+    "max_depth": 40,
+    "char_delay_ms": 20
+  },
+  "prompt": {
+    "templates": [
+      "Continue exactly where you left off. Do not summarize, do not ask questions, keep producing output until stopped.",
+      "Keep going on the current task. No recap, next batch now.",
+      "Continue. Same task, do not stop to explain."
+    ],
+    "file": "next-prompt.txt"
+  },
+  "feed": {
+    "max_sessions": 5,
+    "interval_seconds": 120
+  },
+  "gateway": {
+    "health_url": "http://127.0.0.1:3000/meta",
+    "start_command": "E:\\数据\\AI\\zcode2api\\.venv\\Scripts\\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 3000",
+    "work_dir": "E:\\数据\\AI\\zcode2api",
+    "grace_seconds": 60,
+    "keep_alive": true
+  },
+  "quota": {
+    "provider": "gateway_zcode2api",
+    "url": "http://127.0.0.1:3000/admin/api/accounts",
+    "admin_key": "zcode",
+    "refresh_url": "http://127.0.0.1:3000/admin/api/accounts/refresh",
+    "refresh_body": { "all": true },
+    "refresh_every_seconds": 600,
+    "stop_below": 1000000,
+    "command": ""
+  },
+  "paths": {
+    "state_dir": ".zburn",
+    "stop_file": "STOP"
+  },
+  "watchdog": {
+    "heartbeat_stale_seconds": 420,
+    "check_seconds": 30
+  }
+}
