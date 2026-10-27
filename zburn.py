@@ -96,6 +96,7 @@ DEFAULT_CONFIG = {
     },
     "paths": {"state_dir": ".zburn", "stop_file": "STOP"},
     "watchdog": {"heartbeat_stale_seconds": 420, "check_seconds": 30},
+    "panel": {"host": "127.0.0.1", "port": 8788, "token": "", "autostart": False},
 }
 
 
@@ -647,6 +648,48 @@ def cmd_plugin(a) -> int:
     return 2
 
 
+def cmd_panel(a) -> int:
+    import panel
+    cfg = load_config(a.config)
+    pc = cfg.get("panel") or {}
+    host = a.host or pc.get("host") or "127.0.0.1"
+    port = a.port or int(pc.get("port") or 8788)
+    token = a.token if a.token is not None else (pc.get("token") or "")
+    if a.autostart:
+        a.autostart = True
+    return panel.serve(cfg, host=host, port=port, token=token, config_path=a.config)
+
+
+def cmd_up(a) -> int:
+    """一条命令起来：面板 + 看门狗 + （可选）立刻启动守护。"""
+    import panel
+    cfg = load_config(a.config)
+    pc = cfg.get("panel") or {}
+    st = State(cfg)
+    sup = panel.Supervisor(cfg, st.dir, a.config)
+    if not sup.alive():
+        ok, msg = sup.start()
+        st.log(f"[up] 守护：{msg}")
+    if not a.no_watchdog:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        args = [sys.executable, str(pathlib.Path(__file__).resolve()), "watchdog"]
+        if a.config:
+            args += ["--config", a.config]
+        subprocess.Popen(args, stdout=open(st.dir / "watchdog.out", "a", encoding="utf-8"),
+                         stderr=subprocess.STDOUT, creationflags=flags)
+        st.log("[up] 看门狗已启动")
+    host = a.host or pc.get("host") or "127.0.0.1"
+    port = a.port or int(pc.get("port") or 8788)
+    token = a.token if a.token is not None else (pc.get("token") or "")
+    return panel.serve(cfg, host=host, port=port, token=token, config_path=a.config)
+
+
+def cmd_panel_token(a) -> int:
+    """生成一个随机 token（面板鉴权用）。"""
+    import secrets
+    print(secrets.token_urlsafe(18))
+
+
 # ---------------------------------------------------------------- 入口
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="zburn", description="熄屏守护：锁屏下持续驱动桌面 AI")
@@ -690,6 +733,21 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("plugin", help="安装/卸载自动继续插件")
     p.add_argument("action", choices=["install", "remove"])
     p.set_defaults(func=cmd_plugin)
+
+    for name, fn, helptext in (
+            ("panel", cmd_panel, "起可视化面板（手机/别的电脑可访问）"),
+            ("up", cmd_up, "一条命令：守护 + 看门狗 + 面板")):
+        p = sub.add_parser(name, help=helptext)
+        p.add_argument("--host", default=None, help="监听地址（远程访问用 0.0.0.0）")
+        p.add_argument("--port", type=int, default=None)
+        p.add_argument("--token", default=None, help="面板访问 token（远程访问必填）")
+        if name == "up":
+            p.add_argument("--no-watchdog", action="store_true")
+        if name == "panel":
+            p.add_argument("--autostart", action="store_true", help="面板里默认自动启动守护")
+        p.set_defaults(func=fn)
+
+    sub.add_parser("token", help="生成面板 token").set_defaults(func=cmd_panel_token)
 
     a = ap.parse_args(argv)
     return a.func(a)
