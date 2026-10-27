@@ -67,6 +67,24 @@ python zburn.py watchdog --config config.json
 
 停止：在状态目录放一个 `STOP` 文件，或按 Ctrl+C。`run` 每轮都会检查它。
 
+## 双击启动（像 zcode2api 那样）
+
+仓库根目录放了两个 `.bat`，Windows 下**双击即可**：
+
+| 文件 | 作用 |
+|---|---|
+| `一键启动.bat` | 网关（挂了才拉起）→ 守护进程 → 看门狗 → 面板，并自动打开浏览器 |
+| `启动网关.bat` | 只处理网关：探活，挂了就按 `config.gateway.start_command` 拉起来 |
+
+`一键启动.bat` 等价于：
+
+```powershell
+python zburn.py up --config config.json
+```
+
+它会打印三个地址（本机 / 局域网 / 手机提示），token 没配时**自动生成**并存到 `.zburn/panel.token`，下次复用。
+不想自动开浏览器加 `--no-browser`；不想起看门狗加 `--no-watchdog`。
+
 ## 可视化面板（手机 / 别的电脑都能开）
 
 ![面板](docs/panel.png)

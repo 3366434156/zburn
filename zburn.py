@@ -408,6 +408,58 @@ def inject_once(cfg: dict, st: State, text: str, no_enter: bool = False, dry_run
     return code
 
 
+
+def lan_ip() -> str:
+    """取本机局域网 IP（手机同网段访问用）。"""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
+
+
+def panel_token(cfg: dict, st: State, host: str) -> str:
+    """远程监听时必须给 token；没配就自动生成一个并存到状态目录，下次复用。"""
+    given = (cfg.get("panel") or {}).get("token") or ""
+    if given:
+        return given
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return ""
+    f = st.dir / "panel.token"
+    if f.exists():
+        t = f.read_text().strip()
+        if t:
+            return t
+    import secrets
+    t = secrets.token_urlsafe(12)
+    f.write_text(t)
+    return t
+
+
+def open_browser(url: str) -> None:
+    import webbrowser
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+def print_endpoints(host: str, port: int, token: str) -> None:
+    local = f"http://127.0.0.1:{port}/" + (f"?token={token}" if token else "")
+    print(f"  本机:   {local}")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        ip = lan_ip()
+        print(f"  局域网: http://{ip}:{port}/" + (f"?token={token}" if token else ""))
+        print(f"  手机:   连同一个 Wi-Fi，直接开上面的局域网地址")
+
+
 # ---------------------------------------------------------------- 子命令
 def cmd_doctor(a) -> int:
     cfg = load_config(a.config)
@@ -648,28 +700,58 @@ def cmd_plugin(a) -> int:
     return 2
 
 
+def cmd_gateway(a) -> int:
+    """只处理网关：活着就什么都不做，挂了就按配置拉起来。"""
+    cfg = load_config(a.config)
+    st = State(cfg)
+    g = cfg["gateway"]
+    if not g.get("start_command"):
+        print("配置里没有 gateway.start_command，无法自动拉起（只做探活）")
+    res = ensure_gateway(cfg, st)
+    print(f"网关: {res}")
+    try:
+        info = http_json(g["health_url"], timeout=5)
+        print(f"健康检查通过: {json.dumps(info, ensure_ascii=False)[:120]}")
+        return 0
+    except Exception as e:
+        print(f"健康检查失败: {type(e).__name__} {e}")
+        return 1
+
+
 def cmd_panel(a) -> int:
     import panel
     cfg = load_config(a.config)
+    st = State(cfg)
     pc = cfg.get("panel") or {}
     host = a.host or pc.get("host") or "127.0.0.1"
     port = a.port or int(pc.get("port") or 8788)
-    token = a.token if a.token is not None else (pc.get("token") or "")
-    if a.autostart:
-        a.autostart = True
+    token = a.token if a.token is not None else panel_token(cfg, st, host)
+    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/" + (f"?token={token}" if token else "")
+    print("zburn 面板已启动：")
+    print_endpoints(host, port, token)
+    if getattr(a, "open", False):
+        open_browser(url)
     return panel.serve(cfg, host=host, port=port, token=token, config_path=a.config)
 
 
 def cmd_up(a) -> int:
-    """一条命令起来：面板 + 看门狗 + （可选）立刻启动守护。"""
+    """一键起来：拉起网关（若挂了）→ 守护进程 → 看门狗 → 面板。"""
     import panel
     cfg = load_config(a.config)
-    pc = cfg.get("panel") or {}
     st = State(cfg)
+    pc = cfg.get("panel") or {}
+    st.log("=== zburn up 一键启动 ===")
+
+    gw = ensure_gateway(cfg, st)
+    print(f"网关: {gw}")
+
     sup = panel.Supervisor(cfg, st.dir, a.config)
-    if not sup.alive():
+    if sup.alive():
+        print(f"守护: 已在运行 pid={sup.pid()}")
+    else:
         ok, msg = sup.start()
-        st.log(f"[up] 守护：{msg}")
+        print(f"守护: {msg}")
+
     if not a.no_watchdog:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         args = [sys.executable, str(pathlib.Path(__file__).resolve()), "watchdog"]
@@ -677,10 +759,16 @@ def cmd_up(a) -> int:
             args += ["--config", a.config]
         subprocess.Popen(args, stdout=open(st.dir / "watchdog.out", "a", encoding="utf-8"),
                          stderr=subprocess.STDOUT, creationflags=flags)
-        st.log("[up] 看门狗已启动")
-    host = a.host or pc.get("host") or "127.0.0.1"
+        print("看门狗: 已启动")
+
+    host = a.host or pc.get("host") or "0.0.0.0"
     port = a.port or int(pc.get("port") or 8788)
-    token = a.token if a.token is not None else (pc.get("token") or "")
+    token = a.token if a.token is not None else panel_token(cfg, st, host)
+    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/" + (f"?token={token}" if token else "")
+    print("面板: 已启动")
+    print_endpoints(host, port, token)
+    if not a.no_browser:
+        open_browser(url)
     return panel.serve(cfg, host=host, port=port, token=token, config_path=a.config)
 
 
@@ -743,9 +831,13 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--token", default=None, help="面板访问 token（远程访问必填）")
         if name == "up":
             p.add_argument("--no-watchdog", action="store_true")
+            p.add_argument("--no-browser", action="store_true", help="不要自动打开浏览器")
         if name == "panel":
             p.add_argument("--autostart", action="store_true", help="面板里默认自动启动守护")
+            p.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
         p.set_defaults(func=fn)
+
+    sub.add_parser("gateway", help="只探活/必要时启动网关").set_defaults(func=cmd_gateway)
 
     sub.add_parser("token", help="生成面板 token").set_defaults(func=cmd_panel_token)
 
