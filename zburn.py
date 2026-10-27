@@ -45,6 +45,9 @@ import subprocess
 import sys
 import time
 
+import agents as agentlib
+import zsession
+
 VERSION = "1.0.0"
 HERE = pathlib.Path(__file__).resolve().parent
 SCRIPTS = HERE / "scripts"
@@ -72,6 +75,9 @@ DEFAULT_CONFIG = {
         "window_title_regex": "",
         "max_depth": 40,
         "char_delay_ms": 20,
+        # ZCode 本地会话库（给 supervisor 读真实对话；留空 = ~/.zcode/cli/db/db.sqlite）
+        "session_db": "",
+        "session_work_dir": "",
     },
     "prompt": {
         # 轮换模板，避免每次发一模一样的话被模型"记住"
@@ -100,9 +106,27 @@ DEFAULT_CONFIG = {
         "stop_below": 0,
         "command": "",
     },
-    "paths": {"state_dir": ".zburn", "stop_file": "STOP"},
+    "paths": {"state_dir": ".zburn", "stop_file": "STOP", "bridge_dir": ""},
     "watchdog": {"heartbeat_stale_seconds": 420, "check_seconds": 30},
     "panel": {"host": "127.0.0.1", "port": 8790, "token": "", "autostart": False},
+    # 多 agent：空列表 = 沿用上面 app/uia/feed/prompt 的单应用行为。
+    # 有 agents 时，每一项都可以只写差异字段（会与上面四段深合并）。
+    "agents": [],
+    # 监督编排：supervisor 定时醒来读 worker 的对话尾部，把下一步写进交接文件。
+    "orchestrator": {
+        "enabled": True,
+        "supervisor": "",
+        "worker": "",
+        "prompt": "",
+        "handoff_wait_seconds": 120,
+    },
+    # 「新建对话」按钮：不同客户端叫法不一样，可覆盖。
+    "new_chat": {
+        "enabled": True,
+        "button_regex": "新建任务|新建对话|新对话|新聊天|新建会话|New chat|New task|New conversation",
+        "project": "",
+        "send_button_regex": "",
+    },
 }
 
 
@@ -234,9 +258,11 @@ def run_ps(script: str, params: dict, timeout: int = 180) -> tuple[int, str, str
 def app_running(cfg: dict) -> bool:
     if not IS_WIN:
         return False
+    # 进程名可能带空格（如 "DeepSeek Harness"），必须加引号，否则 Get-Process 直接报错
+    name = str(cfg["app"]["process_name"]).replace("'", "''")
     code, out, _ = subprocess_hidden(
         [pwsh(), "-NoProfile", "-Command",
-         f"(Get-Process -Name {cfg['app']['process_name']} -ErrorAction SilentlyContinue | "
+         f"(Get-Process -Name '{name}' -ErrorAction SilentlyContinue | "
          f"Where-Object {{ $_.MainWindowHandle -ne 0 }} | Measure-Object).Count"])
     return out.strip().isdigit() and int(out.strip()) > 0
 
@@ -516,6 +542,343 @@ def inject_once(cfg: dict, st: State, text: str, no_enter: bool = False, dry_run
     return code
 
 
+# ---------------------------------------------------------------- 多 agent / 交接
+def _read_json_tail(out: str):
+    """ps1 的 stdout 可能夹着别的行；只取最外层的 JSON 数组/对象。"""
+    body = out or ""
+    if "[" in body and "]" in body:
+        body = body[body.index("["): body.rindex("]") + 1]
+    elif "{" in body and "}" in body:
+        body = body[body.index("{"): body.rindex("}") + 1]
+    return json.loads(body) if body.strip() else []
+
+
+def uia_rows(cfg: dict, filter_: str = "Text|ListItem|Paragraph|Document|Window|Button|Edit") -> list[dict]:
+    code, out, err = run_ps("uia-tree.ps1", {
+        "ProcessName": cfg["app"]["process_name"],
+        "WindowTitleRegex": cfg["uia"].get("window_title_regex", ""),
+        "Filter": filter_, "Json": True, "MaxDepth": cfg["uia"]["max_depth"]}, timeout=120)
+    if code != 0:
+        raise RuntimeError((err or out).strip()[:200] or f"uia-tree exit {code}")
+    data = _read_json_tail(out)
+    if isinstance(data, dict):
+        data = [data]
+    return [r for r in data if isinstance(r, dict)]
+
+
+def scan_sessions(cfg: dict) -> tuple[list[dict], str]:
+    """扫描侧栏对话（只读），面板和 run 共用。"""
+    code, out, err = run_ps("feed-sessions.ps1", {
+        "ProcessName": cfg["app"]["process_name"],
+        "WindowTitleRegex": cfg["uia"].get("window_title_regex", ""),
+        "DryRun": True, "Json": True, "MaxDepth": cfg["uia"]["max_depth"]}, timeout=120)
+    try:
+        data = _read_json_tail(out)
+    except Exception:
+        return [], (err or out).strip()[:160] or f"exit {code}"
+    if isinstance(data, dict):
+        data = [data]
+    sessions = [{
+        "name": d.get("name", ""), "key": d.get("key") or d.get("name", ""),
+        "id": d.get("id") or d.get("key") or d.get("name", ""),
+        "ord": d.get("ord", 1), "count": d.get("count", 1),
+        "project": d.get("project", ""), "active": bool(d.get("active")),
+        "x": d.get("x", 0), "y": d.get("y", 0),
+    } for d in data if isinstance(d, dict) and d.get("name")]
+    return sessions, f"扫描到 {len(sessions)} 个会话"
+
+
+def new_chat_once(cfg: dict, st: State, prompt: str, *, project: str = "",
+                  dry_run: bool = False, click_only: bool = False,
+                  agent_id: str = "", clear_residual: bool = False) -> tuple[int, str]:
+    """点「新建任务/新对话」→ 输入首条指令 → 提交。"""
+    nc = cfg.get("new_chat") or {}
+    if not nc.get("enabled", True):
+        return 4, "new_chat 已在配置里关闭"
+    if any(ord(ch) > 126 and ord(ch) not in (10, 13, 9) for ch in prompt):
+        return 4, "新对话指令只能含 ASCII（WM_CHAR 不能投中文/全角标点）"
+    if not agentlib.ascii_only(prompt):
+        return 4, "新对话指令没有 ASCII 字符（WM_CHAR 限制）"
+    params = {
+        "ProcessName": cfg["app"]["process_name"],
+        "WindowTitleRegex": cfg["uia"].get("window_title_regex", ""),
+        "NewChatButtonRegex": nc.get("button_regex") or agentlib.DEFAULT_NEW_CHAT["button_regex"],
+        "ProjectName": project or nc.get("project") or "",
+        "Text": prompt,
+        "SendButtonRegex": nc.get("send_button_regex") or cfg["uia"]["send_button_regex"],
+        "BusyRegex": cfg["uia"]["busy_regex"],
+        "QueuedRegex": cfg["uia"]["queued_regex"],
+        "ComposerMinWidthRatio": float(nc.get("composer_min_width_ratio", 0.40) or 0.40),
+        "CharDelayMs": cfg["uia"]["char_delay_ms"],
+        "MaxDepth": cfg["uia"]["max_depth"],
+        "DryRun": dry_run,
+        "ClickOnly": click_only,
+        "ForceOffscreen": bool(nc.get("allow_offscreen", False)),
+        "ClearResidual": clear_residual or bool(nc.get("clear_residual", False)),
+    }
+    code, out, err = run_ps("new-chat.ps1", params, timeout=600)
+    lines = [ln for ln in (out or "").strip().splitlines() if ln.strip()]
+    summary = lines[-1] if lines else ((err or "").strip()[:200] or f"exit {code}")
+    for ln in lines[:-1][-4:]:
+        st.log("  " + ln)
+    if code == 0 and not dry_run and not click_only:
+        capture_active_session(cfg, st, agent_id)
+    return code, summary
+
+
+def capture_active_session(cfg: dict, st: State, agent_id: str) -> str:
+    """新会话发出去后，把它加进动态监控名单，后续「继续」才会喂到它。"""
+    if not agent_id:
+        return ""
+    for attempt in range(3):
+        time.sleep(1.5)
+        sessions, msg = scan_sessions(cfg)
+        active = next((s for s in sessions if s.get("active")), None)
+        if active and active.get("id"):
+            if agentlib.add_dynamic_target(st, agent_id, active["id"]):
+                st.log(f"[{agent_id}] 新对话已加入监控：{active['id']}")
+            return active["id"]
+    # 侧栏可能还没渲染出新会话；用 ZCode 会话库兜底（它写库比 UI 快）
+    try:
+        work_dir = cfg["uia"].get("session_work_dir") or ""
+        latest = zsession.latest_session(cfg, work_dir)
+        if latest and latest.get("title"):
+            if agentlib.add_dynamic_target(st, agent_id, latest["title"]):
+                st.log(f"[{agent_id}] 新对话已加入监控（会话库）：{latest['title'][:60]}")
+            return latest["title"]
+    except Exception:
+        pass
+    st.log(f"[{agent_id}] 新对话已投递，但没扫描到当前会话（侧栏/会话库都没读到）")
+    return ""
+
+
+def snapshot_agent(cfg: dict, st: State, agent: dict | None = None) -> str:
+    """导出 worker 的对话尾部，供 supervisor 读。
+
+    优先读 ZCode 自己的会话库（完整、不受滚动/内置浏览器影响）；
+    没有配置/没有库时退回 UIA 可见文本（取窗口右侧 30% 以外、当前屏幕内的控件）。
+    """
+    title = (agent or {}).get("name") or cfg["app"]["process_name"]
+    status = {}
+    try:
+        if st.status_path.exists():
+            status = json.loads(st.status_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    logs = []
+    try:
+        if st.log_path.exists():
+            logs = st.log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-60:]
+    except OSError:
+        pass
+    header = [
+        "# zburn supervisor context",
+        f"# agent: {title}",
+        f"# captured: {now()}",
+        f"# last_feed: {status.get('last_feed', '')}",
+        f"# last_feed_summary: {status.get('last_feed_summary', '')}",
+        "",
+        "## recent zburn log",
+        "\n".join(logs),
+        "",
+    ]
+
+    # 1) ZCode 会话库：真实消息（推荐）
+    try:
+        db_text = zsession.context(
+            cfg, feed_targets(cfg),
+            cfg["uia"].get("session_work_dir") or cfg["app"].get("work_dir") or "")
+        if db_text:
+            return "\n".join(header + ["## worker session (from local db)", db_text, ""])
+    except Exception:
+        pass
+
+    # 2) UIA 可见文本：通用兜底
+    try:
+        rows = uia_rows(cfg)
+    except Exception as e:
+        return "\n".join(header + [f"## worker visible transcript", f"(UIA unavailable: {e})", ""])
+    win = None
+    for r in rows:
+        if r.get("type") == "Window" and (win is None or r.get("w", 0) * r.get("h", 0) >
+                                         win.get("w", 0) * win.get("h", 0)):
+            win = r
+    if not win:
+        return "\n".join(header + ["## worker visible transcript", "(no window found)", ""])
+    x0 = float(win.get("x", 0)); y0 = float(win.get("y", 0))
+    ww = float(win.get("w", 1920)); wh = float(win.get("h", 1080))
+    x_min = x0 + ww * 0.30          # 左侧 30% 基本是会话列表/项目树
+    y_min = y0 - 120
+    y_max = y0 + wh + 120
+    pick_types = {"Text", "ListItem", "Paragraph", "Document"}
+    items = []
+    for r in rows:
+        if r.get("type") not in pick_types:
+            continue
+        name = str(r.get("name") or "").strip()
+        if not name:
+            continue
+        x = float(r.get("x", 0)); y = float(r.get("y", 0))
+        if x < x_min or y < y_min or y > y_max:
+            continue
+        items.append((y, x, name))
+    items.sort(key=lambda t: (t[0], t[1]))
+    lines: list[str] = []
+    last = None
+    for _, _, name in items:
+        if name == last:
+            continue
+        last = name
+        lines.append(name.replace("\r", " ").replace("\n", " "))
+    text = "\n".join(lines[-600:])
+    if len(text) > 60000:
+        text = text[-60000:]
+    header.insert(3, f"# window: {win.get('name', '')} ({int(x0)},{int(y0)} {int(ww)}x{int(wh)})")
+    return "\n".join(header + ["## worker visible transcript (oldest -> newest)",
+                               text or "(no visible text)", ""])
+
+
+def build_supervisor_prompt(cfg: dict, st: State, sup: dict, work: dict | None) -> str:
+    prompt = agentlib.supervisor_prompt(cfg, sup, work)
+    p = (sup.get("prompt") or {}).get("file")
+    if p:
+        target = pathlib.Path(p)
+        if not target.is_absolute():
+            target = st.dir / target
+        try:
+            target.write_text(prompt, encoding="utf-8")
+        except OSError:
+            pass
+    return prompt
+
+
+def write_supervisor_bridge(cfg: dict, st: State, sup: dict, work: dict | None,
+                            prompt: str, remaining: int | None = None) -> dict:
+    worker_view = agentlib.agent_view(cfg, work, st) if work else None
+    context = snapshot_agent(worker_view, st, work) if worker_view else "(no worker configured)"
+    status = {}
+    try:
+        if st.status_path.exists():
+            status = json.loads(st.status_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    status.update({"remaining": remaining, "worker": (work or {}).get("name", ""),
+                   "supervisor": sup.get("name", "")})
+    return agentlib.write_bridge(cfg, st, status=status, context=context, prompt=prompt,
+                                 worker_name=(work or {}).get("name", ""),
+                                 supervisor_name=sup.get("name", ""))
+
+
+def apply_handoff(cfg: dict, st: State, rec: dict, worker: dict | None = None) -> dict | None:
+    target = worker
+    if rec.get("agent"):
+        target = agentlib.find_agent(cfg, rec["agent"]) or target
+    if not target:
+        st.log(f"[handoff] 找不到目标 agent（{rec.get('agent') or '未指定'}）→ 忽略")
+        return None
+    pending = agentlib.set_pending(st, target["id"], rec["action"], rec["prompt"],
+                                   project=rec.get("project", ""), source="handoff")
+    st.log(f"[handoff] {pending['action']} → {target['id']}：{pending['prompt'][:100]}")
+    return pending
+
+
+def supervise_now(cfg: dict, st: State, *, dry_run: bool = False, wait: int = 0) -> tuple[int, str]:
+    """立刻让 supervisor 看一眼并验收；wait>0 时等它写出交接并落到 pending。"""
+    sup, work = agentlib.orchestrator(cfg)
+    if not sup:
+        return 2, "没有配置 supervisor（agents 里 role=supervisor）"
+    if not sup.get("enabled", True) and not dry_run:
+        return 2, f"supervisor {sup['id']} 已停用：先在面板「多 Agent」卡点「启用」"
+    work = work or sup
+    prompt = build_supervisor_prompt(cfg, st, sup, work)
+    info = write_supervisor_bridge(cfg, st, sup, work, prompt)
+    if dry_run:
+        return 0, f"监督桥已刷新：{info['dir']}（dry-run，未唤醒）"
+    sup_view = agentlib.agent_view(cfg, sup, st)
+    code, summary = feed_once(sup_view, st, prompt)
+    if code != 0:
+        return code, f"唤醒 {sup['name']} 失败：{summary}"
+    deadline = time.time() + max(0, wait)
+    while time.time() < deadline:
+        time.sleep(5)
+        rec = agentlib.consume_handoff(cfg, st, default_agent=work["id"])
+        if rec:
+            apply_handoff(cfg, st, rec, work)
+            return 0, f"已唤醒并收到交接：{rec['action']} → {rec['prompt'][:80]}"
+    return 0, f"已唤醒 {sup['name']}（{summary}）；交接文件：{info['handoff']}"
+
+
+def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
+                   remaining: int | None, dry_run: bool = False) -> tuple[int, str]:
+    """一个 agent 的一次完整巡检：保活 → a11y → 交接/投喂。"""
+    acfg = agentlib.agent_view(cfg, spec, st)
+    aid = spec["id"]
+    name = spec["name"]
+
+    if acfg["app"].get("start_if_down") and not app_running(acfg):
+        ok, why = start_app(acfg)
+        st.log(f"[{aid}] 应用不在 → {'已拉起' if ok else '拉起失败'}：{why}")
+        time.sleep(10)
+
+    ok_uia, why = uia_ok(acfg)
+    if not ok_uia:
+        st.log(f"[{aid}] 无障碍树不可用（{why}）")
+        if (IS_WIN and acfg["app"].get("start_if_down")
+                and acfg["app"].get("restart_on_uia_fail", True)):
+            pname = acfg["app"]["process_name"]
+            subprocess_hidden([pwsh(), "-NoProfile", "-Command",
+                               f"Stop-Process -Name '{str(pname).replace(chr(39), chr(39) * 2)}' "
+                               f"-Force -ErrorAction SilentlyContinue"])
+            time.sleep(3)
+            ok, why2 = start_app(acfg)
+            st.log(f"[{aid}] 重启应用：{'成功' if ok else '失败'} {why2}")
+            time.sleep(15)
+        agentlib.update_state(st, aid, last_run=now(), last_result=f"uia: {why}")
+        return 1, f"uia: {why}"
+
+    # 1) 有交接：优先执行；新对话在 busy 时保留到下一轮
+    pending = agentlib.get_pending(st, aid)
+    if pending:
+        action = pending["action"]
+        if action == "new_chat":
+            code, summary = new_chat_once(acfg, st, pending["prompt"],
+                                          project=pending.get("project", ""),
+                                          dry_run=dry_run, agent_id=aid)
+        else:
+            code, summary = feed_once(acfg, st, pending["prompt"], dry_run=dry_run)
+        st.log(f"[{aid}] 执行交接 {action}：{summary}")
+        agentlib.update_state(st, aid, last_run=now(), last_action=f"handoff:{action}",
+                              last_result=summary,
+                              last_feed=now() if code == 0 else "")
+        if code == 0 and not dry_run:
+            agentlib.clear_pending(st, aid)
+        return (0 if code in (0, 3, 6) else 1), summary
+
+    # 2) supervisor：刷新监督桥 → 唤醒它
+    if spec["role"] == agentlib.SUPERVISOR and (cfg.get("orchestrator") or {}).get("enabled", True):
+        _, work = agentlib.orchestrator(cfg)
+        work = work or spec
+        prompt = build_supervisor_prompt(cfg, st, spec, work)
+        info = write_supervisor_bridge(cfg, st, spec, work, prompt, remaining)
+        code, summary = feed_once(acfg, st, prompt, dry_run=dry_run)
+        st.log(f"[{aid}] 监督唤醒：{summary}")
+        agentlib.update_state(st, aid, last_run=now(), last_action="supervise",
+                              last_result=summary, last_feed=now() if code == 0 else "")
+        if code == 3:
+            st.log(f"[{aid}] 监督会话没配置：在 agents 里给 {aid} 设 feed.targets（dsh 里那个监督对话的标题）")
+        return (0 if code in (0, 3) else 1), summary
+
+    # 3) worker：普通续派
+    prompt = build_prompt(acfg, st, cycle, remaining)
+    code, summary = feed_once(acfg, st, prompt, dry_run=dry_run)
+    st.log(f"[{aid}] 第 {cycle} 轮投喂：{summary}")
+    agentlib.update_state(st, aid, last_run=now(), last_action="feed",
+                          last_result=summary, last_feed=now() if code == 0 else "")
+    if code == 3:
+        st.log(f"[{aid}] 未指定监控对话：面板「会话监控」勾选或配置 feed.targets 后下一轮开始")
+    return (0 if code in (0, 3) else 1), summary
+
+
 
 def lan_ip() -> str:
     """取本机局域网 IP（手机同网段访问用）。"""
@@ -568,6 +931,52 @@ def print_endpoints(host: str, port: int, token: str) -> None:
         print(f"  手机:   连同一个 Wi-Fi，直接开上面的局域网地址")
 
 
+# ---------------------------------------------------------------- 单调度器锁
+SCHED_LOCK = pathlib.Path(os.environ.get("TEMP") or ".") / "zburn-scheduler.lock"
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    if os.name == "nt":
+        r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True,
+                           text=True, errors="replace",
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return str(pid) in (r.stdout or "")
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_scheduler(tag: str) -> bool:
+    """同一时刻只允许一个调度器操作 UIA：run / autopilot / batch 互斥。
+
+    它们都要「点侧栏切对话 → 打字」，两个同时跑会把字打进别人的对话里。
+    autopilot 派生的分片用 ZBURN_SKIP_SCHED_LOCK=1 跳过这把锁 —— 父进程已经拿着了，
+    分片之间靠 batch.py 里的「投喂锁」串行打字。
+    """
+    if os.environ.get("ZBURN_SKIP_SCHED_LOCK") == "1":
+        return True
+    try:
+        if SCHED_LOCK.exists():
+            parts = SCHED_LOCK.read_text(errors="replace").strip().split()
+            pid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            if _pid_alive(pid):
+                print(f"已有调度器在跑（{' '.join(parts)}）—— 同一时间只能有一个，")
+                print("要换它就先停掉（面板「停止」，或删掉 "
+                      f"{SCHED_LOCK}）。")
+                return False
+            SCHED_LOCK.unlink(missing_ok=True)
+        SCHED_LOCK.write_text(f"{tag} {os.getpid()}")
+        import atexit
+        atexit.register(lambda: SCHED_LOCK.unlink(missing_ok=True))
+        return True
+    except OSError:
+        return True                      # 锁文件本身出问题不阻塞干活
+
+
 # ---------------------------------------------------------------- 子命令
 def cmd_doctor(a) -> int:
     cfg = load_config(a.config)
@@ -586,6 +995,18 @@ def cmd_doctor(a) -> int:
             print(f"     关掉 {cfg['app']['process_name']} 后用 zburn 拉起（会带上这个开关）：")
             print("       python zburn.py restart-app --config config.json")
         print(f"[{'锁屏' if desktop_locked() else '解锁'}] 当前桌面状态（锁屏走 UIA 路径，本来就没问题）")
+
+    if cfg.get("agents"):
+        print("\nAgents:")
+        for s in agentlib.agent_specs(cfg):
+            acfg = agentlib.agent_view(cfg, s, st)
+            on = app_running(acfg)
+            print(f"  [{'OK ' if on else '-- '}] {s['id']:14} {s['role']:10} "
+                  f"{acfg['app']['process_name']:20} "
+                  f"{'在运行' if on else '未运行'}  interval={acfg['feed']['interval_seconds']}s")
+        sup, work = agentlib.orchestrator(cfg)
+        print(f"  监督编排: supervisor={sup['id'] if sup else '-'}  worker={work['id'] if work else '-'}"
+              f"  bridge={agentlib.bridge_dir(cfg)}")
 
     g = cfg["gateway"]
     try:
@@ -633,6 +1054,12 @@ def cmd_status(a) -> int:
     if hb.exists():
         age = int(time.time()) - int(hb.read_text() or 0)
         print(f"心跳: {age} 秒前")
+    print("\nAgents:")
+    for ag in agentlib.describe(cfg, st):
+        pending = ag.get("pending") or {}
+        print(f"  [{'on' if ag['enabled'] else 'off'}] {ag['id']:14} {ag['role']:10} "
+              f"{ag['process_name']:20} {ag['last_result'][:60] if ag['last_result'] else '-'}"
+              + (f"  pending={pending.get('action')}" if pending else ""))
     if st.log_path.exists():
         lines = st.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         print(f"\n最近 15 行日志（共 {len(lines)} 行）：")
@@ -656,10 +1083,13 @@ def cmd_status(a) -> int:
 
 def cmd_probe(a) -> int:
     cfg = load_config(a.config)
+    st = State(cfg)
+    spec = agentlib.find_agent(cfg, getattr(a, "agent", None))
+    acfg = agentlib.agent_view(cfg, spec, st) if spec else cfg
     code, out, err = run_ps("uia-tree.ps1", {
-        "ProcessName": cfg["app"]["process_name"],
-        "WindowTitleRegex": cfg["uia"].get("window_title_regex", ""),
-        "Filter": a.filter or "", "Json": a.json, "MaxDepth": cfg["uia"]["max_depth"]})
+        "ProcessName": acfg["app"]["process_name"],
+        "WindowTitleRegex": acfg["uia"].get("window_title_regex", ""),
+        "Filter": a.filter or "", "Json": a.json, "MaxDepth": acfg["uia"]["max_depth"]})
     print(out or err)
     return code
 
@@ -667,17 +1097,25 @@ def cmd_probe(a) -> int:
 def cmd_inject(a) -> int:
     cfg = load_config(a.config)
     st = State(cfg)
-    return inject_once(cfg, st, a.text, no_enter=a.no_enter, dry_run=a.dry_run)
+    spec = agentlib.find_agent(cfg, getattr(a, "agent", None))
+    acfg = agentlib.agent_view(cfg, spec, st) if spec else cfg
+    return inject_once(acfg, st, a.text, no_enter=a.no_enter, dry_run=a.dry_run)
 
 
 def cmd_feed(a) -> int:
     cfg = load_config(a.config)
     st = State(cfg)
-    prompt = a.prompt or build_prompt(cfg, st, 0, read_quota(cfg))
-    st.log(f"投喂一轮（dry-run={a.dry_run}）指令: {prompt[:60]}…")
-    code, summary = feed_once(cfg, st, prompt, dry_run=a.dry_run)
+    spec = agentlib.find_agent(cfg, getattr(a, "agent", None))
+    if not spec:
+        spec = (agentlib.orchestrator(cfg)[1] or agentlib.agent_specs(cfg)[0])
+    acfg = agentlib.agent_view(cfg, spec, st)
+    prompt = a.prompt or build_prompt(acfg, st, 0, read_quota(cfg))
+    st.log(f"[{spec['id']}] 投喂一轮（dry-run={a.dry_run}）指令: {prompt[:60]}…")
+    code, summary = feed_once(acfg, st, prompt, dry_run=a.dry_run)
     st.log("结果: " + (summary or f"exit {code}"))
     st.status(last_feed=now(), last_feed_summary=summary)
+    agentlib.update_state(st, spec["id"], last_action="feed", last_result=summary,
+                          last_feed=now() if code == 0 else "")
     return 0 if code == 0 else code
 
 
@@ -700,17 +1138,26 @@ def _sleep_or_stop(st: State, seconds: int) -> bool:
 def cmd_run(a) -> int:
     cfg = load_config(a.config)
     st = State(cfg)
+    if not acquire_scheduler("run"):
+        return 4
     st.log(f"=== zburn {VERSION} 启动 (dry-run={a.dry_run}) ===")
-    win_re = cfg["uia"].get("window_title_regex") or ""
-    st.log(f"应用={cfg['app']['process_name']}"
-           f" 窗口={('/' + win_re + '/') if win_re else '任意'}"
-           f" 会话={describe_selection(cfg)}"
-           f" 间隔={cfg['feed']['interval_seconds']}s"
-           f" 会话上限={cfg['feed']['max_sessions']} 额度源={cfg['quota']['provider']}")
+    for s in agentlib.enabled_agents(cfg):
+        acfg = agentlib.agent_view(cfg, s, st)
+        win_re = acfg["uia"].get("window_title_regex") or ""
+        st.log(f"agent {s['id']}（{s['name']} / {s['role']}）"
+               f" 应用={acfg['app']['process_name']}"
+               f" 窗口={('/' + win_re + '/') if win_re else '任意'}"
+               f" 会话={describe_selection(acfg)}"
+               f" 间隔={acfg['feed']['interval_seconds']}s")
+    st.log(f"额度源={cfg['quota']['provider']}；STOP 文件={st.stop_file}")
     cycle = 0
-    fails = 0
-    warned_no_selection = False
+    fails: dict[str, int] = {}
     last_refresh = 0.0
+    last_gateway = 0.0
+    last_quota = 0.0
+    last_run: dict[str, float] = {}
+    remaining: int | None = None
+    gw = "disabled"
     try:
         while True:
             if st.stop_file.exists():
@@ -718,66 +1165,63 @@ def cmd_run(a) -> int:
                 st.status(state="stopped", reason="stop-file")
                 return 0
             cfg = reload_config(a.config, cfg)   # 面板改的参数下一轮生效
-            cycle += 1
+            specs = agentlib.enabled_agents(cfg)
             st.heartbeat()
+            now_ts = time.time()
 
-            # 1) 应用保活
-            if cfg["app"].get("start_if_down") and not app_running(cfg):
-                ok, why = start_app(cfg)
-                st.log(f"应用不在 → {'已拉起' if ok else '拉起失败'}：{why}")
-                time.sleep(12)
+            # 1) 网关保活（只探活，不重启）—— 每 60 秒一次，别让 pwsh 每 5 秒起一个
+            if now_ts - last_gateway >= 60:
+                gw = ensure_gateway(cfg, st)
+                last_gateway = now_ts
 
-            # 2) 网关保活（只探活，不重启）
-            gw = ensure_gateway(cfg, st)
+            # 2) 额度：每 60 秒读一次；到点主动刷新
+            if now_ts - last_quota >= 60:
+                remaining = read_quota(cfg)
+                last_quota = now_ts
+                q = cfg["quota"]
+                if remaining is not None:
+                    st.quota_row(remaining, gw)
+                    if q.get("refresh_every_seconds") and now_ts - last_refresh > q["refresh_every_seconds"]:
+                        refresh_quota(cfg)
+                        last_refresh = now_ts
+                    if q.get("stop_below") and remaining <= q["stop_below"]:
+                        st.log(f"额度 {remaining:,} ≤ 阈值 {q['stop_below']:,} → 收工")
+                        st.status(state="finished", remaining=remaining)
+                        return 0
 
-            # 3) 额度
-            remaining = read_quota(cfg)
-            q = cfg["quota"]
-            if remaining is not None:
-                st.quota_row(remaining, gw)
-                if q.get("refresh_every_seconds") and time.time() - last_refresh > q["refresh_every_seconds"]:
-                    refresh_quota(cfg)
-                    last_refresh = time.time()
-                if q.get("stop_below") and remaining <= q["stop_below"]:
-                    st.log(f"额度 {remaining:,} ≤ 阈值 {q['stop_below']:,} → 收工")
-                    st.status(state="finished", remaining=remaining)
-                    return 0
-            st.status(state="running", cycle=cycle, remaining=remaining, gateway=gw,
-                      locked=desktop_locked())
+            # 3) 交接文件：按「监督者写的下一步」排队，不等它同步返回
+            worker = agentlib.orchestrator(cfg)[1]
+            default_agent = worker["id"] if worker else (specs[0]["id"] if specs else "")
+            rec = agentlib.consume_handoff(cfg, st, default_agent)
+            if rec:
+                apply_handoff(cfg, st, rec, worker)
 
-            # 4) 无障碍树健康（锁屏久了会被 Chromium 关掉）
-            ok_uia, why = uia_ok(cfg)
-            if not ok_uia:
-                st.log(f"无障碍树不可用（{why}）→ 尝试重启应用恢复")
-                if IS_WIN and cfg["app"].get("start_if_down"):
-                    subprocess_hidden([pwsh(), "-NoProfile", "-Command",
-                                       f"Stop-Process -Name {cfg['app']['process_name']} -Force "
-                                       f"-ErrorAction SilentlyContinue"])
-                    time.sleep(3)
-                    ok, why2 = start_app(cfg)
-                    st.log(f"重启应用：{'成功' if ok else '失败'} {why2}")
-                    time.sleep(20)
-                fails += 1
+            # 4) 到点的 agent 各跑一轮（每个 agent 有自己的 interval）
+            due = [s for s in specs
+                   if now_ts - last_run.get(s["id"], 0.0) >=
+                   max(20, int((s["feed"] or {}).get("interval_seconds") or 120))]
+            if due:
+                cycle += 1
+                for s in due:
+                    code, summary = run_agent_once(cfg, st, s, cycle, remaining, a.dry_run)
+                    last_run[s["id"]] = time.time()
+                    fails[s["id"]] = 0 if code == 0 else fails.get(s["id"], 0) + 1
+                    st.status(state="running", cycle=cycle, remaining=remaining, gateway=gw,
+                              locked=desktop_locked(), last_feed_summary=summary,
+                              agents=agentlib.describe(cfg, st),
+                              handoff=agentlib.handoff_status(cfg, st, default_agent))
+                    # supervisor 挂了不该拖死 worker；只有 worker（或唯一 agent）连续失败才收工
+                    if fails[s["id"]] >= 5 and (
+                            s["role"] == agentlib.WORKER or len(specs) == 1):
+                        st.log(f"[{s['id']}] 连续失败过多 → 收工（看 docs/故障排查.md）")
+                        st.status(state="error", reason="too-many-failures")
+                        return 1
             else:
-                # 5) 投喂
-                prompt = build_prompt(cfg, st, cycle, remaining)
-                code, summary = feed_once(cfg, st, prompt, dry_run=a.dry_run)
-                st.log(f"第 {cycle} 轮投喂：{summary}")
-                st.status(last_feed=now(), last_feed_summary=summary, uia=why)
-                if code == 3:
-                    # 没勾会话：这是等配置，不是故障。不计失败，也别每轮刷同一句
-                    if not warned_no_selection:
-                        st.log("等你勾选监控对话：面板「会话监控」勾选保存后，下一轮自动开始投喂")
-                        warned_no_selection = True
-                else:
-                    fails = 0 if code == 0 else fails + 1
+                st.status(state="running", cycle=cycle, remaining=remaining, gateway=gw,
+                          locked=desktop_locked(), agents=agentlib.describe(cfg, st),
+                          handoff=agentlib.handoff_status(cfg, st, default_agent))
 
-            if fails >= 5:
-                st.log("连续失败过多 → 收工（看 docs/故障排查.md）")
-                st.status(state="error", reason="too-many-failures")
-                return 1
-
-            if _sleep_or_stop(st, cfg["feed"]["interval_seconds"]):
+            if _sleep_or_stop(st, 5):
                 st.log("发现 STOP 文件 → 收工")
                 st.status(state="stopped", reason="stop-file")
                 return 0
@@ -928,13 +1372,17 @@ def cmd_restart_app(a) -> int:
     """
     cfg = load_config(a.config)
     st = State(cfg)
-    name = cfg["app"]["process_name"]
-    if not app_running(cfg):
-        ok, msg = start_app(cfg)
-        print(f"应用没在跑，直接拉起：{msg}")
+    spec = agentlib.find_agent(cfg, getattr(a, "agent", None))
+    if not spec:
+        spec = agentlib.agent_specs(cfg)[0]
+    acfg = agentlib.agent_view(cfg, spec, st)
+    name = acfg["app"]["process_name"]
+    if not app_running(acfg):
+        ok, msg = start_app(acfg)
+        print(f"[{spec['id']}] 应用没在跑，直接拉起：{msg}")
         return 0 if ok else 1
     if not a.yes:
-        print(f"要重启 {name}（会打断里面正在跑的任务）。确认请输入 yes：", end=" ", flush=True)
+        print(f"要重启 {name}（{spec['id']}，会打断里面正在跑的任务）。确认请输入 yes：", end=" ", flush=True)
         try:
             ans = input().strip().lower()
         except EOFError:
@@ -946,22 +1394,186 @@ def cmd_restart_app(a) -> int:
     subprocess.run(["taskkill", "/IM", f"{name}.exe", "/F"], capture_output=True, creationflags=flags)
     st.log(f"[restart-app] 已结束 {name}，准备带 a11y 开关重启")
     time.sleep(3)
-    ok, msg = start_app(cfg)
+    ok, msg = start_app(acfg)
     print(f"重启：{msg}")
     time.sleep(8)
-    ok_uia, why = uia_ok(cfg)
+    ok_uia, why = uia_ok(acfg)
     print(f"[{'OK ' if ok_uia else 'FAIL'}] 无障碍树：{why}")
     return 0 if ok_uia else 1
+
+
+def cmd_agents(a) -> int:
+    """列出多 agent 配置与最近状态。"""
+    cfg = load_config(a.config)
+    st = State(cfg)
+    specs = agentlib.agent_specs(cfg)
+    sup, work = agentlib.orchestrator(cfg)
+    print(f"zburn {VERSION}  agents={len(specs)}  bridge={agentlib.bridge_dir(cfg)}")
+    print(f"{'':3} {'id':14} {'role':10} {'process':20} {'间隔':>7}  监控")
+    for s in specs:
+        state = agentlib.read_state(st, s["id"])
+        pending = agentlib.get_pending(st, s["id"])
+        flag = "on" if s.get("enabled", True) else "off"
+        targets = s["feed"].get("targets") or []
+        extra = f"targets={len(targets)}"
+        if pending:
+            extra += f" pending={pending['action']}"
+        if state.get("last_result"):
+            extra += f" last={str(state['last_result'])[:42]}"
+        print(f"{flag:3} {s['id']:14} {s['role']:10} {s['app'].get('process_name',''):20} "
+              f"{s['feed'].get('interval_seconds', 0):>6}s  {extra}")
+    print(f"\nsupervisor={sup['id'] if sup else '-'}  worker={work['id'] if work else '-'}")
+    rec, src = agentlib.read_handoff(cfg, st, work["id"] if work else "")
+    print("待处理交接: " + (json.dumps(rec, ensure_ascii=False) if rec else "无")
+          + (f"（{src}）" if src else ""))
+    return 0
+
+
+def cmd_newchat(a) -> int:
+    """在指定 agent 里新建一个对话并投递首条指令。"""
+    cfg = load_config(a.config)
+    st = State(cfg)
+    spec = agentlib.find_agent(cfg, getattr(a, "agent", None))
+    if not spec:
+        spec = agentlib.orchestrator(cfg)[1] or agentlib.agent_specs(cfg)[0]
+    acfg = agentlib.agent_view(cfg, spec, st)
+    prompt = a.prompt or ""
+    if not prompt:
+        p = acfg["prompt"].get("file") or "next-prompt.txt"
+        target = pathlib.Path(p)
+        if not target.is_absolute():
+            target = st.dir / target
+        if target.exists():
+            prompt = target.read_text(encoding="utf-8").strip()
+    if not prompt:
+        print("没有指令：用 --prompt 或先写 next-prompt.txt")
+        return 2
+    code, summary = new_chat_once(acfg, st, prompt,
+                                  project=a.project or acfg["new_chat"].get("project", ""),
+                                  dry_run=a.dry_run, click_only=a.click_only,
+                                  agent_id=spec["id"], clear_residual=a.clear_residual)
+    st.log(f"[{spec['id']}] 新建对话（dry-run={a.dry_run}）：{summary}")
+    st.status(last_new_chat=now(), last_new_chat_summary=summary)
+    print(summary)
+    return code
+
+
+def cmd_handoff(a) -> int:
+    """写/看/执行一份监督交接。supervisor 也可以在 shell 里直接调它。"""
+    cfg = load_config(a.config)
+    st = State(cfg)
+    sup, work = agentlib.orchestrator(cfg)
+    default_agent = work["id"] if work else ""
+    if a.action == "clear":
+        n = agentlib.clear_handoff(cfg, st)
+        print(f"已清空 {n} 个交接文件")
+        if a.clear_pending:
+            for s in agentlib.agent_specs(cfg):
+                if agentlib.get_pending(st, s["id"]):
+                    agentlib.clear_pending(st, s["id"])
+                    print(f"  已清空 {s['id']} 的待执行队列")
+        return 0
+    if a.list:
+        rec, src = agentlib.read_handoff(cfg, st, default_agent)
+        queued = {s["id"]: agentlib.get_pending(st, s["id"])
+                  for s in agentlib.agent_specs(cfg) if agentlib.get_pending(st, s["id"])}
+        print(json.dumps({"pending": rec, "source": src, "queued": queued},
+                         ensure_ascii=False, indent=1))
+        return 0
+    if a.apply:
+        rec = agentlib.consume_handoff(cfg, st, default_agent)
+        if not rec:
+            print("没有待处理交接")
+            return 1
+        pending = apply_handoff(cfg, st, rec, work)
+        print(json.dumps({"consumed": rec, "pending": pending}, ensure_ascii=False, indent=1))
+        return 0 if pending else 1
+    prompt = a.prompt or ""
+    if a.file:
+        prompt = pathlib.Path(a.file).read_text(encoding="utf-8", errors="replace")
+    if not prompt and not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    if not prompt.strip():
+        print("没有 prompt：用 --prompt、--file，或从 stdin 传入")
+        return 2
+    try:
+        rec = agentlib.write_handoff(cfg, st, a.action, prompt,
+                                     agent=a.agent or default_agent, project=a.project)
+    except ValueError as e:
+        print(f"交接未写入：{e}")
+        return 2
+    st.log(f"[handoff] 写入 {rec['action']} → {rec['agent']}：{rec['prompt'][:100]}")
+    print(json.dumps(rec, ensure_ascii=False, indent=1))
+    return 0
+
+
+def cmd_supervise(a) -> int:
+    """立刻唤醒 supervisor（可选等它写出交接并落到 pending）。"""
+    cfg = load_config(a.config)
+    st = State(cfg)
+    if a.apply:
+        sup, work = agentlib.orchestrator(cfg)
+        rec = agentlib.consume_handoff(cfg, st, work["id"] if work else "")
+        if not rec:
+            print("没有待处理交接")
+            return 1
+        pending = apply_handoff(cfg, st, rec, work)
+        print(json.dumps({"consumed": rec, "pending": pending}, ensure_ascii=False, indent=1))
+        return 0 if pending else 1
+    wait = a.wait
+    if wait is None:
+        wait = int((cfg.get("orchestrator") or {}).get("handoff_wait_seconds") or 0)
+    code, msg = supervise_now(cfg, st, dry_run=a.dry_run, wait=wait)
+    st.log(f"[supervise] {msg}")
+    print(msg)
+    return code
+
+
+def cmd_snapshot(a) -> int:
+    """导出 worker 的可见对话尾部（supervisor 的输入）。"""
+    cfg = load_config(a.config)
+    st = State(cfg)
+    spec = agentlib.find_agent(cfg, getattr(a, "agent", None))
+    if not spec:
+        spec = agentlib.orchestrator(cfg)[1] or agentlib.agent_specs(cfg)[0]
+    acfg = agentlib.agent_view(cfg, spec, st)
+    text = snapshot_agent(acfg, st, spec)
+    p = st.dir / f"context-{spec['id']}.txt"
+    p.write_text(text, encoding="utf-8")
+    bridge = agentlib.ensure_bridge(cfg)
+    (bridge / "context.txt").write_text(text, encoding="utf-8")
+    print(f"[{spec['id']}] 对话快照：{p}（{len(text)} 字符）")
+    print(text[:800])
+    return 0
 
 
 def cmd_batch(a) -> int:
     """按队列一条条做：投喂 → 等它改文件 → 跑验收 → 记账。"""
     import batch
     cfg = load_config(a.config)
+    if getattr(a, "state_dir", ""):
+        cfg.setdefault("paths", {})["state_dir"] = a.state_dir
     st = State(cfg)
-    st.log(f"=== batch {a.queue} 开始（dry-run={a.dry_run}）===")
+    if not acquire_scheduler("batch"):
+        return 4
+    st.log(f"=== batch {a.queue} 开始（dry-run={a.dry_run}，targets={getattr(a, 'target', None)}）===")
     return batch.run_queue(cfg, st, a.queue, max_tasks=a.max, only=a.only or "",
-                           dry_run=a.dry_run, retries=a.retries)
+                           dry_run=a.dry_run, retries=a.retries,
+                           targets=getattr(a, "target", None))
+
+
+def cmd_autopilot(a) -> int:
+    """夜间总控：分片 + 看住进程 + 修应用/网关，直到队列做完或出现 STOP。"""
+    import autopilot
+    cfg = load_config(a.config)
+    if getattr(a, "state_dir", ""):
+        cfg.setdefault("paths", {})["state_dir"] = a.state_dir
+    st = State(cfg)
+    if not acquire_scheduler("autopilot"):
+        return 4
+    return autopilot.run(cfg, st, a.queue, a.target or feed_targets(cfg), shards=a.shards,
+                         max_per_shard=a.max, config_path=a.config,
+                         poll=a.poll, max_hours=a.hours)
 
 
 def cmd_panel_token(a) -> int:
@@ -990,23 +1602,60 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("probe", help="导出无障碍树（换应用时用）")
     p.add_argument("--filter", default="", help="按控件类型过滤，如 'Edit|Button'")
+    p.add_argument("--agent", default=None, help="看哪个 agent 的窗口（默认第一个）")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_probe)
 
     p = sub.add_parser("inject", help="直接往输入框投一条")
     p.add_argument("--text", required=True)
+    p.add_argument("--agent", default=None, help="往哪个 agent 投（默认第一个）")
     p.add_argument("--no-enter", action="store_true", help="只输入不提交")
     p.add_argument("--dry-run", action="store_true", help="只定位控件，不输入")
     p.set_defaults(func=cmd_inject)
 
     p = sub.add_parser("feed", help="投喂一轮")
     p.add_argument("--prompt", default=None, help="覆盖提示词（默认按模板轮换）")
+    p.add_argument("--agent", default=None, help="只喂某个 agent（默认 worker/第一个）")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_feed)
 
     p = sub.add_parser("run", help="守护循环")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_run)
+
+    sub.add_parser("agents", help="列出多 agent 配置与状态").set_defaults(func=cmd_agents)
+
+    p = sub.add_parser("newchat", help="新建一个对话并投递首条指令")
+    p.add_argument("--agent", default=None, help="目标 agent（默认 worker）")
+    p.add_argument("--prompt", default=None, help="首条指令（ASCII）")
+    p.add_argument("--project", default=None, help="目标项目名（ZCode 的项目行）")
+    p.add_argument("--dry-run", action="store_true", help="只定位新建按钮，不点击")
+    p.add_argument("--click-only", action="store_true", help="只点开新对话，不输入")
+    p.add_argument("--clear-residual", action="store_true",
+                   help="输入框有残留时用 SetValue 清空（只在你确认那是自己的草稿时用）")
+    p.set_defaults(func=cmd_newchat)
+
+    p = sub.add_parser("handoff", help="写/看/执行监督交接")
+    p.add_argument("--action", default="feed", choices=["feed", "new_chat", "clear"])
+    p.add_argument("--prompt", default=None, help="下一步指令（ASCII）")
+    p.add_argument("--file", default=None, help="从文件读 prompt")
+    p.add_argument("--agent", default=None, help="目标 agent（默认 worker）")
+    p.add_argument("--project", default=None, help="新对话所在项目")
+    p.add_argument("--list", action="store_true", help="只看待处理交接")
+    p.add_argument("--apply", action="store_true", help="取走交接并排进目标 agent 的待执行队列")
+    p.add_argument("--clear-pending", action="store_true", help="连同各 agent 的待执行队列一起清空")
+    p.set_defaults(func=cmd_handoff)
+
+    p = sub.add_parser("supervise", help="立刻唤醒 supervisor 验收（可等交接）")
+    p.add_argument("--wait", type=int, default=None,
+                   help="等多少秒收交接（默认 orchestrator.handoff_wait_seconds；0=不等）")
+    p.add_argument("--dry-run", action="store_true", help="只刷新监督桥，不唤醒")
+    p.add_argument("--apply", action="store_true", help="只执行已经存在的交接")
+    p.set_defaults(func=cmd_supervise)
+
+    p = sub.add_parser("snapshot", help="导出 worker 的可见对话尾部（给 supervisor 看）")
+    p.add_argument("--agent", default=None, help="目标 agent（默认 worker）")
+    p.set_defaults(func=cmd_snapshot)
 
     sub.add_parser("watchdog", help="看门狗（心跳超时拉起 run）").set_defaults(func=cmd_watchdog)
 
@@ -1039,13 +1688,27 @@ def main(argv: list[str] | None = None) -> int:
     bp.add_argument("--max", type=int, default=0, help="本次最多做几条（0=不限）")
     bp.add_argument("--only", default="", help="只做 id 含该字样 / 该组的任务")
     bp.add_argument("--retries", type=int, default=1, help="失败重试次数（默认 1）")
+    bp.add_argument("--target", action="append", help="只喂这个对话（可多次；面板「会话监控」里的 id）")
+    bp.add_argument("--state-dir", default="", help="状态目录（分片各用一份，互不干扰）")
     bp.add_argument("--dry-run", action="store_true", help="只打印要做什么，不投喂")
     bp.set_defaults(func=cmd_batch)
+
+    ap2 = sub.add_parser("autopilot", help="夜间总控：分片并发 + 看住进程 + 修应用/网关")
+    ap2.add_argument("--config", default=__import__("argparse").SUPPRESS)
+    ap2.add_argument("--queue", required=True, help="队列 JSON 路径")
+    ap2.add_argument("--target", action="append", help="专用对话 id（几个对话就几个分片）")
+    ap2.add_argument("--shards", type=int, default=0, help="分片数（默认=对话数）")
+    ap2.add_argument("--max", type=int, default=0, help="每片最多做几条（0=不限）")
+    ap2.add_argument("--poll", type=int, default=60, help="巡检秒数")
+    ap2.add_argument("--hours", type=float, default=12.0, help="最长跑几小时")
+    ap2.add_argument("--state-dir", default="", help="状态目录")
+    ap2.set_defaults(func=cmd_autopilot)
 
     sub.add_parser("token", help="生成面板 token").set_defaults(func=cmd_panel_token)
 
     rp = sub.add_parser("restart-app", help="带无障碍开关重启目标应用（修 a11y 树为空）")
     rp.add_argument("--config", default=__import__("argparse").SUPPRESS)
+    rp.add_argument("--agent", default=None, help="要重启哪个 agent（默认第一个）")
     rp.add_argument("--yes", action="store_true", help="不问直接重启（会打断应用里正在跑的任务）")
     rp.set_defaults(func=cmd_restart_app)
 

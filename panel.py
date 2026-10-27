@@ -170,6 +170,9 @@ CONFIG_FIELDS: dict[str, tuple[tuple[str, str], type]] = {
     "stop_below": (("quota", "stop_below"), int),
     "panel_host": (("panel", "host"), str),
     "panel_port": (("panel", "port"), int),
+    "new_chat_button_regex": (("new_chat", "button_regex"), str),
+    "new_chat_project": (("new_chat", "project"), str),
+    "bridge_dir": (("paths", "bridge_dir"), str),
 }
 
 
@@ -282,6 +285,16 @@ def collect(cfg: dict, st, sup: Supervisor, tail: int = 120,
             pass
 
     running = sup.alive()
+    agent_list = []
+    handoff = {}
+    try:
+        agent_list = zburn.agentlib.describe(cfg, st)
+        worker = zburn.agentlib.orchestrator(cfg)[1]
+        handoff = zburn.agentlib.handoff_status(cfg, st, worker["id"] if worker else "")
+    except Exception:
+        pass
+    sup_prompt = ((cfg.get("orchestrator") or {}).get("prompt")
+                  or zburn.agentlib.DEFAULT_SUPERVISOR_PROMPT)
     return {
         "version": VERSION,
         "running": running,
@@ -299,6 +312,10 @@ def collect(cfg: dict, st, sup: Supervisor, tail: int = 120,
         "remaining": remaining,
         "quota_history": hist,
         "logs": logs,
+        "agents": agent_list,
+        "handoff": handoff,
+        "supervisor_prompt": sup_prompt,
+        "bridge_dir": str(zburn.agentlib.bridge_dir(cfg)),
         "config": {
             "process_name": cfg["app"]["process_name"],
             "app_exe": cfg["app"].get("exe", ""),
@@ -319,6 +336,9 @@ def collect(cfg: dict, st, sup: Supervisor, tail: int = 120,
             "panel_host": (cfg.get("panel") or {}).get("host", "127.0.0.1"),
             "panel_port": (cfg.get("panel") or {}).get("port", 8788),
             "config_path": config_path or "<内置默认>",
+            "new_chat_button_regex": (cfg.get("new_chat") or {}).get("button_regex", ""),
+            "new_chat_project": (cfg.get("new_chat") or {}).get("project", ""),
+            "bridge_dir": str(zburn.agentlib.bridge_dir(cfg)),
         },
     }
 
@@ -386,36 +406,19 @@ def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token:
                 return self._json(200, collect(cfg, st, sup, config_path=config_path,
                                                panel_url=self._panel_url()))
             if u.path == "/api/sessions":
-                # 扫描应用侧栏的对话（只读，不输入），给「会话监控」卡片勾选用
-                params = {"ProcessName": cfg["app"]["process_name"],
-                          "WindowTitleRegex": cfg["uia"].get("window_title_regex", ""),
-                          "DryRun": True, "Json": True, "MaxDepth": cfg["uia"]["max_depth"]}
-                code, out, err = zburn.run_ps("feed-sessions.ps1", params, timeout=120)
-                sessions = []
-                try:
-                    # 只取 JSON 部分：ps1 可能还有别的输出行
-                    body = out[out.index("["):] if "[" in out else out
-                    data = json.loads(body)
-                    if isinstance(data, dict):
-                        data = [data]
-                    # id = 稳定的监控标识：唯一对话就是标题（去掉末尾相对时间），
-                    # 同名对话再加 #序号（侧栏里同名能有好几条，必须分得清）
-                    sessions = [{"name": d.get("name", ""),
-                                 "key": d.get("key") or d.get("name", ""),
-                                 "id": d.get("id") or d.get("key") or d.get("name", ""),
-                                 "ord": d.get("ord", 1),
-                                 "count": d.get("count", 1),
-                                 "project": d.get("project", ""),
-                                 "active": bool(d.get("active")),
-                                 "x": d.get("x", 0), "y": d.get("y", 0)}
-                                for d in data if isinstance(d, dict) and d.get("name")]
-                except Exception:
-                    return self._json(200, {"ok": False, "sessions": [],
-                                            "targets": cfg["feed"].get("targets", []),
-                                            "msg": (err or out).strip()[:160] or f"exit {code}"})
-                return self._json(200, {"ok": True, "sessions": sessions,
-                                        "targets": cfg["feed"].get("targets", []),
-                                        "msg": f"扫描到 {len(sessions)} 个会话"})
+                # 扫描指定 agent 侧栏的对话（只读，不输入），给「会话监控」卡片勾选用
+                q = parse_qs(u.query)
+                agent = (q.get("agent") or [None])[0]
+                spec = zburn.agentlib.find_agent(cfg, agent)
+                acfg = zburn.agentlib.agent_view(cfg, spec, st) if spec else cfg
+                sessions, msg = zburn.scan_sessions(acfg)
+                return self._json(200, {
+                    "ok": msg.startswith("扫描到"),
+                    "agent": spec["id"] if spec else (cfg.get("agent_id") or "default"),
+                    "sessions": sessions,
+                    "targets": acfg["feed"].get("targets", []),
+                    "msg": msg,
+                })
             if u.path == "/api/prompt":
                 p = pathlib.Path(cfg["prompt"].get("file") or "next-prompt.txt")
                 if not p.is_absolute():
@@ -451,12 +454,163 @@ def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token:
                 st.log(f"[panel] 停止守护：{msg}")
                 return self._json(200, {"ok": ok, "msg": msg})
             if u.path == "/api/feed":
-                prompt = zburn.build_prompt(cfg, st, int(time.time() / 60) % 3, zburn.read_quota(cfg))
-                code, summary = zburn.feed_once(cfg, st, prompt)
-                return self._json(200, {"ok": code == 0, "msg": summary})
+                spec = zburn.agentlib.find_agent(cfg, body.get("agent"))
+                if not spec:
+                    spec = zburn.agentlib.orchestrator(cfg)[1] or zburn.agentlib.agent_specs(cfg)[0]
+                acfg = zburn.agentlib.agent_view(cfg, spec, st)
+                prompt = (body.get("prompt") or "").strip() or \
+                    zburn.build_prompt(acfg, st, int(time.time() / 60) % 3, zburn.read_quota(cfg))
+                code, summary = zburn.feed_once(acfg, st, prompt)
+                return self._json(200, {"ok": code == 0, "msg": summary, "agent": spec["id"]})
             if u.path == "/api/gateway":
                 res = zburn.ensure_gateway(cfg, st)
                 return self._json(200, {"ok": "started" in res or "alive" in res, "msg": res})
+            if u.path == "/api/agent":
+                action = str(body.get("action") or "").strip()
+                if action == "supervise":
+                    code, msg = zburn.supervise_now(
+                        cfg, st, dry_run=bool(body.get("dry_run")),
+                        wait=int(body.get("wait") or 0))
+                    st.log(f"[panel] 唤醒监督：{msg}")
+                    return self._json(200, {"ok": code == 0, "msg": msg})
+                spec = zburn.agentlib.find_agent(cfg, body.get("agent"))
+                if not spec:
+                    return self._json(400, {"ok": False, "msg": "没指定 agent"})
+                if action == "toggle":
+                    want = bool(body.get("enabled", not spec.get("enabled", True)))
+                    cp = pathlib.Path(config_path) if config_path else None
+                    cur = {}
+                    if cp and cp.exists():
+                        try:
+                            cur = json.loads(cp.read_text(encoding="utf-8"))
+                        except Exception as e:
+                            return self._json(500, {"ok": False, "msg": f"配置读不出来：{e}"})
+                    hit = False
+                    for ent in (cur.get("agents") or []):
+                        if isinstance(ent, dict) and ent.get("id") == spec["id"]:
+                            ent["enabled"] = want
+                            hit = True
+                    if not hit:
+                        return self._json(400, {"ok": False,
+                                                "msg": "这个 agent 来自顶层 app，不在 agents 列表中，无法单独启停"})
+                    if cp:
+                        try:
+                            (cp.parent / (cp.name + ".bak")).write_text(
+                                cp.read_text(encoding="utf-8"), encoding="utf-8")
+                        except OSError:
+                            pass
+                        cp.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+                    cfg["agents"] = cur.get("agents") or []
+                    st.log(f"[panel] agent {spec['id']} → {'启用' if want else '停用'}")
+                    return self._json(200, {"ok": True,
+                                            "msg": f"{spec['id']} 已{'启用' if want else '停用'}（守护下一轮生效）"})
+                if action == "targets":
+                    targets = body.get("targets")
+                    if not isinstance(targets, list):
+                        return self._json(400, {"ok": False, "msg": "targets 要是数组"})
+                    targets = [str(t).strip() for t in targets if str(t).strip()]
+                    cp = pathlib.Path(config_path) if config_path else None
+                    cur = {}
+                    if cp and cp.exists():
+                        try:
+                            cur = json.loads(cp.read_text(encoding="utf-8"))
+                        except Exception as e:
+                            return self._json(500, {"ok": False, "msg": f"配置读不出来：{e}"})
+                    hit = False
+                    for ent in (cur.get("agents") or []):
+                        if isinstance(ent, dict) and ent.get("id") == spec["id"]:
+                            ent.setdefault("feed", {})["targets"] = targets
+                            hit = True
+                    if not hit:
+                        return self._json(400, {"ok": False,
+                                                "msg": "这个 agent 来自顶层 app，不在 agents 列表中"})
+                    if cp:
+                        try:
+                            (cp.parent / (cp.name + ".bak")).write_text(
+                                cp.read_text(encoding="utf-8"), encoding="utf-8")
+                        except OSError:
+                            pass
+                        cp.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+                    cfg["agents"] = cur.get("agents") or []
+                    st.log(f"[panel] agent {spec['id']} targets={targets}")
+                    return self._json(200, {"ok": True,
+                                            "msg": f"{spec['id']} 监控名单已保存（{len(targets)} 个）"})
+                if action == "cleardyn":
+                    zburn.agentlib.clear_dynamic_targets(st, spec["id"])
+                    st.log(f"[panel] agent {spec['id']} 清空动态监控名单")
+                    return self._json(200, {"ok": True, "msg": f"{spec['id']} 动态监控名单已清空"})
+                acfg = zburn.agentlib.agent_view(cfg, spec, st)
+                if action == "feed":
+                    prompt = (body.get("prompt") or "").strip() or \
+                        zburn.build_prompt(acfg, st, int(time.time() / 60) % 3, zburn.read_quota(cfg))
+                    code, msg = zburn.feed_once(acfg, st, prompt)
+                elif action == "newchat":
+                    prompt = (body.get("prompt") or "").strip()
+                    if not prompt:
+                        p = pathlib.Path(acfg["prompt"].get("file") or "next-prompt.txt")
+                        if not p.is_absolute():
+                            p = st.dir / p
+                        prompt = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+                    if not prompt:
+                        return self._json(400, {"ok": False, "msg": "新对话指令为空"})
+                    code, msg = zburn.new_chat_once(
+                        acfg, st, prompt,
+                        project=(body.get("project") or acfg["new_chat"].get("project", "")),
+                        agent_id=spec["id"])
+                elif action == "snapshot":
+                    text = zburn.snapshot_agent(acfg, st, spec)
+                    return self._json(200, {"ok": True, "agent": spec["id"],
+                                            "msg": text[:8000]})
+                else:
+                    return self._json(400, {"ok": False, "msg": f"未知 action: {action}"})
+                st.log(f"[panel] {spec['id']} {action}：{msg}")
+                return self._json(200, {"ok": code == 0, "msg": msg, "agent": spec["id"]})
+            if u.path == "/api/handoff":
+                act = str(body.get("action") or "feed")
+                sup, work = zburn.agentlib.orchestrator(cfg)
+                default_agent = work["id"] if work else ""
+                if act == "clear":
+                    n = zburn.agentlib.clear_handoff(cfg, st)
+                    if body.get("clear_pending"):
+                        for s in zburn.agentlib.agent_specs(cfg):
+                            zburn.agentlib.clear_pending(st, s["id"])
+                    return self._json(200, {"ok": True, "msg": f"已清空 {n} 个交接文件"})
+                if act == "apply":
+                    rec = zburn.agentlib.consume_handoff(cfg, st, default_agent)
+                    if not rec:
+                        return self._json(200, {"ok": True, "msg": "没有待处理交接"})
+                    pending = zburn.apply_handoff(cfg, st, rec, work)
+                    return self._json(200, {"ok": bool(pending), "msg": "已排入待执行队列",
+                                            "pending": pending})
+                try:
+                    rec = zburn.agentlib.write_handoff(
+                        cfg, st, act, body.get("prompt") or "",
+                        agent=body.get("agent") or default_agent,
+                        project=body.get("project") or "")
+                except ValueError as e:
+                    return self._json(400, {"ok": False, "msg": str(e)})
+                st.log(f"[panel] 写入交接 {rec['action']} → {rec['agent']}")
+                return self._json(200, {"ok": True, "msg": "交接已写入", "handoff": rec})
+            if u.path == "/api/supervisor_prompt":
+                text = str(body.get("text") or "").strip()
+                cp = pathlib.Path(config_path) if config_path else None
+                cur = {}
+                if cp and cp.exists():
+                    try:
+                        cur = json.loads(cp.read_text(encoding="utf-8"))
+                    except Exception as e:
+                        return self._json(500, {"ok": False, "msg": f"配置读不出来：{e}"})
+                cur.setdefault("orchestrator", {})["prompt"] = text
+                if cp:
+                    try:
+                        (cp.parent / (cp.name + ".bak")).write_text(
+                            cp.read_text(encoding="utf-8"), encoding="utf-8")
+                    except OSError:
+                        pass
+                    cp.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+                zerun_stub(cfg, cur)
+                st.log("[panel] 监督提示词已更新")
+                return self._json(200, {"ok": True, "msg": "监督提示词已保存"})
             if u.path == "/api/prompt":
                 text = (body.get("text") or "").strip()
                 p = pathlib.Path(cfg["prompt"].get("file") or "next-prompt.txt")

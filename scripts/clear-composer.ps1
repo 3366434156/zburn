@@ -1,5 +1,7 @@
 # 尝试把聊天输入框里残留的测试文本清掉（清不掉就明确告诉人）
-# 手段顺序：① 名字含 清除/清空 的按钮 → ② Escape 键 → ③ 报错，让人手动删
+# ⚠️ 会向目标窗口发 Escape；如果目标正在生成，可能中断当前回合。只在确认安全时运行。
+# 手段顺序：① ValuePattern.SetValue('')（ZCode 实测可用）→ ② 名字含 清除/清空 的按钮
+#          → ③ Escape 键 → ④ 报错，让人手动删
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -Namespace Zc -Name N -MemberDefinition @"
@@ -35,7 +37,23 @@ $read = { ($v.Current.Value -replace "[`r`n]+$", '') }
 "残留: '$(& $read)'"
 $er = $e.Current.BoundingRectangle
 
-# ① 输入框附近、名字像"清除"的按钮
+# ① 直接 SetValue：退格/WM_CHAR 清不掉，但 ValuePattern.SetValue 在 ZCode 实测可以
+"① 试 ValuePattern.SetValue('')"
+$setOk = $false
+try {
+    $v.SetValue('')
+    $setOk = $true
+    Start-Sleep -Milliseconds 350
+    "SetValue 后: '$(& $read)'"
+} catch {
+    "SetValue 失败: $($_.Exception.Message)"
+}
+if ((& $read).Length -eq 0) {
+    if ($setOk) { "✅ 已清空（SetValue）"; exit 0 }
+    "输入框本来就是空的"; exit 0
+}
+
+# ② 输入框附近、名字像"清除"的按钮
 $near = @($script:btns | Where-Object {
         $_.Name -match '清除|清空|重置|删除|Clear|Reset' -and
         [Math]::Abs($_.Y - [int]$er.Y) -lt 120 -and [Math]::Abs($_.X - [int]$er.X) -lt 900
@@ -47,7 +65,7 @@ if ($near.Count -gt 0) {
 } else { "没有找到名字像清除的按钮（附近按钮: $((@($script:btns | Where-Object { [Math]::Abs($_.Y - [int]$er.Y) -lt 120 }) | ForEach-Object { $_.Name }) -join ', '))" }
 
 if ((& $read).Length -gt 0) {
-    "② 试 Escape"
+    "③ 试 Escape"
     [void][Zc.N]::PostMessage($top, 0x0100, [IntPtr]0x1B, [IntPtr]0x00010001)
     [void][Zc.N]::PostMessage($top, 0x0101, [IntPtr]0x1B, [IntPtr]0xC0010001)
     Start-Sleep -Milliseconds 600

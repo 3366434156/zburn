@@ -140,6 +140,25 @@ details[open] summary:before{transform:rotate(90deg)}
 .monrow .xbtn:hover{color:#ff9a94;border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.08)}
 .monempty{color:var(--dim2);font-size:12.5px;padding:6px 2px}
 
+/* ---------- 多 Agent ---------- */
+.agentlist{display:grid;gap:8px}
+.agentrow{display:flex;align-items:center;gap:9px;flex-wrap:wrap;background:#0f141b;
+  border:1px solid var(--line);border-radius:11px;padding:10px 11px}
+.agentrow .aname{font-weight:700;font-size:13.5px;min-width:0;overflow-wrap:anywhere}
+.agentrow .ameta{color:var(--dim2);font-size:11.5px;min-width:0;overflow-wrap:anywhere;flex:1 1 100%}
+.agentrow .role{font-size:10.5px;font-weight:700;padding:2px 7px;border-radius:999px;
+  color:#79c0ff;background:rgba(47,129,247,.14);border:1px solid rgba(47,129,247,.4)}
+.agentrow .role.sup{color:#d2a8ff;background:rgba(163,113,247,.12);border-color:rgba(163,113,247,.4)}
+.agentrow .role.off{color:#8b949e;background:rgba(139,148,158,.08);border-color:rgba(139,148,158,.3)}
+.agentrow .abtns{display:flex;gap:6px;flex-wrap:wrap;width:100%}
+.agentrow .abtns .btn{width:auto;min-height:32px;padding:6px 10px;font-size:12.5px}
+.agentrow .pending{color:#e3b341;font-size:11.5px;flex:1 1 100%}
+.agentrow .atarget{display:flex;gap:6px;width:100%}
+.agentrow .atarget input{flex:1;min-width:0;padding:7px 9px;font-size:12px}
+#snapBox{margin:10px 0 0;padding:10px;max-height:220px;overflow:auto;border:1px solid var(--line);
+  border-radius:10px;background:#0a0e13;color:#9fb3c8;font:11.5px/1.55 ui-monospace,Consolas,monospace;
+  white-space:pre-wrap;word-break:break-all;display:none}
+
 /* ---------- 日志 ---------- */
 .logbox{background:#0a0e13;border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .logbox .bar{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);
@@ -300,6 +319,28 @@ input:hover,textarea:hover{border-color:#2c3a4d}
     <div id="sessList" class="sesslist"><div class="none">点「扫描侧栏对话」列出 ZCode 侧栏里的会话，勾选要监控的，再点「保存勾选」。</div></div>
     <div class="hint" id="sessWarn"></div>
     <div class="hint" id="sessHint"></div>
+    <div class="hint">这里只改 worker（顶层）的监控名单；supervisor 的监督对话在多 Agent 卡里单独填。</div>
+  </div>
+
+  <div class="card span2">
+    <h2>多 Agent <span>worker 干活；supervisor（如 dsh）定时读对话、验收后写下一步</span></h2>
+    <div id="agentList" class="agentlist"><div class="none">还没有 agent 配置。在 config.json 里写 agents。</div></div>
+    <div class="g2" style="margin-top:12px">
+      <div><label>新对话指令（只收 ASCII）</label><input id="newChatPrompt" placeholder="Start a new task: ..."></div>
+      <div><label>新对话所在项目（ZCode 可填 zburn）</label><input id="newChatProject" placeholder="留空 = 配置里的 new_chat.project"></div>
+    </div>
+    <div class="btnrow" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+      <button class="btn sm ghost" onclick="actAgent('supervise')">唤醒监督（现在验收）</button>
+      <button class="btn sm ghost" onclick="applyHandoff()">执行待处理交接</button>
+    </div>
+    <div class="hint" id="handoffHint">没有待处理交接</div>
+    <pre id="snapBox"></pre>
+    <label style="margin-top:14px">监督提示词（{context} / {status} / {handoff} 会替换成桥目录路径）</label>
+    <textarea id="supPrompt" style="min-height:120px" placeholder="读 context.txt，判断是否验收通过；需要下一步就写 handoff.json…"></textarea>
+    <div class="btnrow" style="grid-template-columns:1fr">
+      <button class="btn" onclick="saveSupPrompt()">保存监督提示词</button>
+    </div>
+    <div class="hint" id="bridgeHint"></div>
   </div>
 
   <div class="card span2">
@@ -322,6 +363,9 @@ input:hover,textarea:hover{border-color:#2c3a4d}
       <label>额度接口</label><input id="cfgQuotaUrl" placeholder="http://127.0.0.1:3000/admin/api/accounts">
       <label>额度管理密钥</label><input id="cfgAdminKey" placeholder="zcode">
       <label>发送按钮正则</label><input id="cfgSendRegex" placeholder="发送|加入队列|Send">
+      <label>新建对话按钮正则</label><input id="cfgNewChat" placeholder="新建任务|新建对话|New chat">
+      <label>新建对话默认项目（ZCode 填项目名）</label><input id="cfgNewChatProject" placeholder="zburn">
+      <label>监督桥目录（留空 = %LOCALAPPDATA%\zburn-bridge）</label><input id="cfgBridge" placeholder="C:\Users\...\AppData\Local\zburn-bridge">
       <div class="g2">
         <div><label>面板监听地址</label><input id="cfgHost" placeholder="127.0.0.1 或 0.0.0.0"></div>
         <div><label>面板端口</label><input id="cfgPort" type="number" min="1" max="65535"></div>
@@ -550,17 +594,121 @@ async function saveCfg(){
     quota_url: val('cfgQuotaUrl'),
     admin_key: val('cfgAdminKey'),
     send_button_regex: val('cfgSendRegex'),
+    new_chat_button_regex: val('cfgNewChat'),
+    new_chat_project: val('cfgNewChatProject'),
+    bridge_dir: val('cfgBridge'),
     panel_host: val('cfgHost'),
     panel_port: +val('cfgPort')
   };
   // 会话正则/窗口正则允许清空（清空=只喂勾选的会话），其余空值照旧跳过
-  const clearable = ['session_regex', 'window_title_regex'];
+  const clearable = ['session_regex', 'window_title_regex', 'new_chat_project', 'bridge_dir'];
   Object.keys(body).forEach(k => {
     if((body[k]==='' || Number.isNaN(body[k])) && !clearable.includes(k)) delete body[k];
   });
   try{
     const r = await api('/api/config', {method:'POST', body: JSON.stringify(body)});
     toast(r.msg || '参数已保存'); setTimeout(load, 700);
+  }catch(e){ toast('保存失败：'+e.message, true); }
+}
+
+// ---------- 多 Agent ----------
+let agentSig = '';
+function renderAgents(list){
+  const box = document.getElementById('agentList');
+  if(!list || !list.length){
+    box.innerHTML = '<div class="none">还没有 agent 配置。在 config.json 里写 agents。</div>';
+    return;
+  }
+  box.innerHTML = list.map(a=>{
+    const role = a.role === 'supervisor'
+      ? '<span class="role sup">supervisor</span>'
+      : '<span class="role">worker</span>';
+    const off = a.enabled ? '' : ' <span class="role off">off</span>';
+    const pending = a.pending
+      ? `<div class="pending">待执行：${esc(a.pending.action)} · ${esc((a.pending.prompt||'').slice(0,180))}</div>` : '';
+    const last = a.last_result ? ` · 上次：${esc(a.last_result).slice(0,100)}` : '';
+    const dyn = (a.dynamic_targets||[]).length;
+    const nMon = (a.targets||[]).length + dyn;
+    const monTxt = `监控 ${nMon} 个` + (dyn ? `（动态 +${dyn}）` : '');
+    const tgt = esc((a.targets||[]).join(' | '));
+    const clearDyn = dyn ? `<button class="btn sm ghost" data-act="cleardyn" data-id="${esc(a.id)}">清空动态</button>` : '';
+    return `<div class="agentrow">` +
+      `<span class="aname">${esc(a.name)}</span>${role}${off}` +
+      `<span class="ameta">${esc(a.process_name)} · 每 ${a.interval_seconds}s · ${monTxt}${last}</span>` +
+      pending +
+      `<div class="atarget"><input data-target-id="${esc(a.id)}" value="${tgt}" placeholder="监控会话标题，多个用 | 分隔">` +
+        `<button class="btn sm ghost" data-act="targets" data-id="${esc(a.id)}">保存目标</button></div>` +
+      `<div class="abtns">` +
+        (a.role === 'supervisor'
+          ? `<button class="btn sm ghost" data-act="supervise" data-id="${esc(a.id)}">唤醒</button>`
+          : `<button class="btn sm ghost" data-act="feed" data-id="${esc(a.id)}">投喂</button>`) +
+        `<button class="btn sm ghost" data-act="newchat" data-id="${esc(a.id)}">新对话</button>` +
+        `<button class="btn sm ghost" data-act="handoff" data-id="${esc(a.id)}">写交接</button>` +
+        `<button class="btn sm ghost" data-act="snapshot" data-id="${esc(a.id)}">看快照</button>` +
+        `<button class="btn sm ghost" data-act="toggle" data-id="${esc(a.id)}" data-enabled="${a.enabled?1:0}">${a.enabled?'停用':'启用'}</button>` +
+        clearDyn +
+      `</div></div>`;
+  }).join('');
+  box.querySelectorAll('button[data-act]').forEach(b=>{
+    b.onclick = () => actAgent(b.dataset.act, b.dataset.id, b.dataset.enabled);
+  });
+}
+
+async function actAgent(action, id, enabledFlag){
+  const prompt = document.getElementById('newChatPrompt').value.trim();
+  const project = document.getElementById('newChatProject').value.trim();
+  if(action === 'newchat' && !prompt){
+    toast('先填「新对话指令」（只收 ASCII）', true);
+    return;
+  }
+  if(action === 'handoff' && !prompt){
+    toast('先填要交给 worker 的指令', true);
+    return;
+  }
+  try{
+    if(action === 'supervise'){
+      toast('正在刷新监督桥并唤醒 supervisor…');
+      const r = await api('/api/agent', {method:'POST', body: JSON.stringify({action:'supervise'})});
+      toast(r.msg || '已唤醒');
+    }else if(action === 'snapshot'){
+      const r = await api('/api/agent', {method:'POST', body: JSON.stringify({action:'snapshot', agent:id})});
+      const box = document.getElementById('snapBox');
+      box.style.display = 'block'; box.textContent = r.msg || '(空)';
+      toast('快照已更新');
+    }else if(action === 'handoff'){
+      const r = await api('/api/handoff', {method:'POST', body: JSON.stringify({action:'feed', agent:id, prompt})});
+      toast(r.msg || '交接已写入');
+    }else if(action === 'toggle'){
+      const want = enabledFlag !== '1';
+      const r = await api('/api/agent', {method:'POST', body: JSON.stringify({action:'toggle', agent:id, enabled:want})});
+      toast(r.msg || '已切换');
+    }else if(action === 'targets'){
+      const inp = document.querySelector(`[data-target-id="${id}"]`);
+      const list = (inp ? inp.value : '').split(/[|,，\n]/).map(s=>s.trim()).filter(Boolean);
+      const r = await api('/api/agent', {method:'POST', body: JSON.stringify({action:'targets', agent:id, targets:list})});
+      toast(r.msg || '目标已保存');
+    }else{
+      const r = await api('/api/agent', {method:'POST', body: JSON.stringify({action, agent:id, prompt, project})});
+      toast(r.msg || '已完成');
+    }
+    setTimeout(load, 800);
+  }catch(e){ toast('失败：'+e.message, true); }
+}
+
+async function applyHandoff(){
+  try{
+    const r = await api('/api/handoff', {method:'POST', body: JSON.stringify({action:'apply'})});
+    toast(r.msg || '已执行');
+    setTimeout(load, 700);
+  }catch(e){ toast('失败：'+e.message, true); }
+}
+
+async function saveSupPrompt(){
+  try{
+    const r = await api('/api/supervisor_prompt', {method:'POST',
+      body: JSON.stringify({text: document.getElementById('supPrompt').value})});
+    toast(r.msg || '已保存');
+    setTimeout(load, 700);
   }catch(e){ toast('保存失败：'+e.message, true); }
 }
 
@@ -623,6 +771,18 @@ async function load(){
     ? '只对上面这些对话续派；侧栏里改过名的对话需要重新扫描勾选。'
     : ('当前没有监控任何对话' + (s.config.session_regex ? '（按正则喂）' : '（不会投喂）'));
 
+  // 多 agent：列表/待执行交接变了才重绘，避免 3 秒轮询把按钮点掉
+  const agList = s.agents || [];
+  // 不要把 last_result 放进签名：它每轮都会变，会把正在输入的「监控目标」输入框重绘掉
+  const agSig = JSON.stringify(agList.map(a=>[a.id, a.enabled, a.pending,
+                                               a.targets, a.dynamic_targets]));
+  if(agSig !== agentSig){ agentSig = agSig; renderAgents(agList); }
+  const h = (s.handoff || {}).pending;
+  document.getElementById('handoffHint').textContent = h
+    ? `待处理：${h.action} · ${(h.prompt||'').slice(0,180)}`
+    : '没有待处理交接';
+  document.getElementById('bridgeHint').textContent = '监督桥：' + (s.bridge_dir || '—');
+
   // 手机地址：服务端按实际绑定地址算（绑了 0.0.0.0 且有 token 才给）
   lastPanelUrl = s.panel_url || '';
   document.getElementById('vPanelUrl').textContent = lastPanelUrl || (location.origin + '/?token=…');
@@ -648,8 +808,13 @@ async function load(){
     set('cfgQuotaUrl', s.config.quota_url);
     set('cfgAdminKey', s.config.admin_key);
     set('cfgSendRegex', s.config.send_button_regex);
+    set('cfgNewChat', s.config.new_chat_button_regex);
+    set('cfgNewChatProject', s.config.new_chat_project);
+    set('cfgBridge', s.config.bridge_dir);
     set('cfgHost', s.config.panel_host);
     set('cfgPort', s.config.panel_port);
+    set('supPrompt', s.supervisor_prompt);
+    set('newChatProject', s.config.new_chat_project);
     document.getElementById('vCfgPath').textContent = s.config.config_path || '—';
     api('/api/prompt').then(t=>{ document.getElementById('prompt').value = t; }).catch(()=>{});
     first = false;

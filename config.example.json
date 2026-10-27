@@ -2,8 +2,12 @@
   "app": {
     "process_name": "ZCode",
     "exe": "E:\\exe\\Zcode\\ZCode.exe",
-    "start_args": ["--force-renderer-accessibility"],
-    "strip_env": ["ELECTRON_RUN_AS_NODE"],
+    "start_args": [
+      "--force-renderer-accessibility"
+    ],
+    "strip_env": [
+      "ELECTRON_RUN_AS_NODE"
+    ],
     "start_if_down": true
   },
   "uia": {
@@ -13,7 +17,9 @@
     "session_regex": "",
     "window_title_regex": "",
     "max_depth": 40,
-    "char_delay_ms": 20
+    "char_delay_ms": 20,
+    "session_db": "",
+    "session_work_dir": ""
   },
   "prompt": {
     "templates": [
@@ -40,7 +46,9 @@
     "url": "http://127.0.0.1:3000/admin/api/accounts",
     "admin_key": "zcode",
     "refresh_url": "http://127.0.0.1:3000/admin/api/accounts/refresh",
-    "refresh_body": { "all": true },
+    "refresh_body": {
+      "all": true
+    },
     "refresh_every_seconds": 600,
     "stop_below": 1000000,
     "command": ""
@@ -57,5 +65,64 @@
     "host": "0.0.0.0",
     "port": 8790,
     "token": ""
+  },
+  "agents": [
+    {
+      "id": "zcode",
+      "name": "ZCode",
+      "role": "worker",
+      "enabled": true,
+      "feed": {
+        "targets": []
+      }
+    },
+    {
+      "id": "dsh",
+      "name": "dsh",
+      "role": "supervisor",
+      "enabled": false,
+      "supervises": "zcode",
+      "app": {
+        "process_name": "DeepSeek Harness",
+        "exe": "E:\\exe\\DeepSeek Harness\\DeepSeek Harness.exe",
+        "start_args": [
+          "--force-renderer-accessibility"
+        ],
+        "strip_env": [
+          "ELECTRON_RUN_AS_NODE"
+        ],
+        "start_if_down": true
+      },
+      "uia": {
+        "send_button_regex": "发送|Send",
+        "busy_regex": "停止|Stop",
+        "queued_regex": "排队|Queue",
+        "session_regex": "",
+        "window_title_regex": "",
+        "session_db": null,
+        "session_work_dir": ""
+      },
+      "feed": {
+        "targets": [],
+        "interval_seconds": 600,
+        "max_sessions": 1
+      },
+      "prompt": {
+        "file": "supervisor-prompt.txt"
+      }
+    }
+  ],
+  "orchestrator": {
+    "enabled": true,
+    "supervisor": "dsh",
+    "worker": "zcode",
+    "prompt": "",
+    "handoff_wait_seconds": 120
+  },
+  "new_chat": {
+    "enabled": true,
+    "button_regex": "新建任务|新建对话|新对话|新聊天|新建会话|New chat|New task|New conversation",
+    "project": "",
+    "send_button_regex": ""
   }
 }

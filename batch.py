@@ -62,11 +62,15 @@ def save_state(state_dir: pathlib.Path, state: dict) -> None:
     os.replace(tmp, p)
 
 
-def _run(cmd: str, cwd: str | None, timeout: int = 900) -> tuple[int, str]:
+def _run(cmd: str, cwd: str | None, timeout: int = 900, env: dict | None = None) -> tuple[int, str]:
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    full_env = None
+    if env:
+        full_env = dict(os.environ)
+        full_env.update({k: str(v) for k, v in env.items()})
     try:
         r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True,
-                           errors="replace", timeout=timeout, creationflags=flags)
+                           errors="replace", timeout=timeout, creationflags=flags, env=full_env)
         return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
     except subprocess.TimeoutExpired:
         return 124, f"超时 {timeout}s"
@@ -81,8 +85,31 @@ def _mtime(path: pathlib.Path) -> float:
         return 0.0
 
 
+def _feed_lock(timeout: int = 240):
+    """全局投喂锁：同一时刻只允许一个进程往应用里打字。
+
+    并行分片各自「点侧栏切对话 → 打字」，若不互斥，A 打到一半 B 把侧栏切走，
+    A 剩下的字符就灌进 B 那个对话里了 —— 必须串行。
+    """
+    lock = pathlib.Path(os.environ.get("TEMP") or ".") / "zburn-feed.lock"
+    t0 = time.time()
+    while True:
+        try:
+            if lock.exists() and time.time() - lock.stat().st_mtime > 600:
+                lock.unlink(missing_ok=True)      # 上一把锁的进程崩了
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return lock
+        except FileExistsError:
+            if time.time() - t0 > timeout:
+                raise TimeoutError(f"等了 {timeout}s 还没拿到投喂锁 {lock}")
+            time.sleep(1.5)
+
+
 def run_queue(cfg: dict, st, queue_path: str, *, max_tasks: int = 0,
-              only: str = "", dry_run: bool = False, retries: int = 1) -> int:
+              only: str = "", dry_run: bool = False, retries: int = 1,
+              targets: list[str] | None = None) -> int:
     import zburn
 
     q = load_queue(queue_path)
@@ -94,6 +121,8 @@ def run_queue(cfg: dict, st, queue_path: str, *, max_tasks: int = 0,
         tasks = [t for t in tasks if only in t["id"] or only == t.get("group")]
         if not tasks:
             raise SystemExit(f"没有匹配 {only} 的任务")
+    if targets:                                  # 一个分片只喂自己那个对话
+        cfg.setdefault("feed", {})["targets"] = list(targets)
 
     state = load_state(st.dir)
     if not dry_run and not (zburn.feed_targets(cfg) or (cfg["uia"].get("session_regex") or "").strip()):
@@ -102,7 +131,12 @@ def run_queue(cfg: dict, st, queue_path: str, *, max_tasks: int = 0,
 
     done = skipped = failed = 0
     limit = max_tasks or len(tasks)
+    snap_dir = st.dir / "before"
+    snap_dir.mkdir(parents=True, exist_ok=True)
     for t in tasks:
+        if st.stop_file.exists():                # 随时可停：不等一轮跑完
+            print("发现 STOP 文件 → 停下")
+            break
         if done + failed >= limit:
             break
         tid = t["id"]
@@ -116,6 +150,12 @@ def run_queue(cfg: dict, st, queue_path: str, *, max_tasks: int = 0,
 
         watch = (pathlib.Path(cwd or ".") / t["watch"]) if t.get("watch") else None
         before = _mtime(watch) if watch else 0.0
+        snap = snap_dir / f"{tid}.frag"
+        if watch and watch.exists():             # 留一份改动前的快照，验收时要对比
+            try:
+                snap.write_bytes(watch.read_bytes())
+            except OSError:
+                pass
 
         if dry_run:
             print(f"[dry-run] {tid}  verify: {t['verify']}")
@@ -128,7 +168,23 @@ def run_queue(cfg: dict, st, queue_path: str, *, max_tasks: int = 0,
         if rec.get("note"):                     # 上一轮失败原因回灌给模型
             prompt += f" Previous attempt failed: {rec['note'][:160]}"
         st.log(f"[batch] 投喂 {tid}：{prompt[:90]}…")
-        code, summary = zburn.feed_once(cfg, st, prompt)
+        code, summary = 1, ""
+        for attempt in range(1, 21):           # 对话在忙/输入框有残文时：腾空、等、再试
+            lock = _feed_lock()
+            try:
+                code, summary = zburn.feed_once(cfg, st, prompt)
+            finally:
+                lock.unlink(missing_ok=True)
+            if code == 0 and "typed=0" not in str(summary) and "跳过" not in str(summary):
+                break
+            st.log(f"[batch] {tid} 第 {attempt} 次投喂未成功（{summary}）→ 腾空输入框，等 90 秒再来")
+            zburn.run_ps("flush-composer.ps1",
+                         {"ProcessName": cfg["app"]["process_name"]}, timeout=90)
+            if st.stop_file.exists():
+                break
+            time.sleep(90)
+        if code != 0 or "typed=0" in str(summary) or "跳过" in str(summary):
+            st.log(f"[batch] {tid} 投喂失败 exit={code} {summary}")
         if code != 0:
             st.log(f"[batch] {tid} 投喂失败 exit={code} {summary}")
             print(f"[x] {tid} 投喂失败：{summary}")
@@ -145,7 +201,8 @@ def run_queue(cfg: dict, st, queue_path: str, *, max_tasks: int = 0,
             time.sleep(poll)
             if watch and _mtime(watch) <= before:
                 continue                        # 文件还没被动过，别急着验收
-            vcode, vout = _run(t["verify"], cwd, timeout=min(600, wait))
+            vcode, vout = _run(t["verify"], cwd, timeout=min(600, wait),
+                               env={"FX_BEFORE": str(snap)})
             if vcode == 0:
                 verdict, note = "done", "验收通过"
                 break

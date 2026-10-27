@@ -147,6 +147,39 @@ python zburn.py plugin install
 # 开关文件：~/.zburn/continue.enabled（没有它钩子只写日志不干预）
 ```
 
+## 多 Agent：让 dsh 监督 ZCode（新）
+
+一个 worker 干活、一个 supervisor 定时醒来验收——不再只会往旧会话里灌 `Continue`：
+
+```jsonc
+"agents": [
+  { "id": "zcode", "name": "ZCode", "role": "worker", "enabled": true },
+  { "id": "dsh", "name": "dsh", "role": "supervisor", "enabled": false,
+    "supervises": "zcode",
+    "app": { "process_name": "DeepSeek Harness",
+             "exe": "E:\\exe\\DeepSeek Harness\\DeepSeek Harness.exe",
+             "start_args": ["--force-renderer-accessibility"],
+             "strip_env": ["ELECTRON_RUN_AS_NODE"] },
+    "feed": { "targets": ["zburn 监督"], "interval_seconds": 600 } }
+],
+"orchestrator": { "enabled": true, "supervisor": "dsh", "worker": "zcode" },
+"new_chat": { "button_regex": "新建任务|新建对话|New chat", "project": "zburn" }
+```
+
+* **supervisor 看什么**：优先读 ZCode 本地会话库（`~/.zcode/cli/db/db.sqlite`）里
+  监控对话的真实消息，导出到 `%LOCALAPPDATA%\zburn-bridge\context.txt`；
+  读不到才退回 UIA 可见文本。
+* **supervisor 怎么回话**：往同一个桥目录写 `handoff.json`
+  （`{"action":"feed"|"new_chat","prompt":"..."}`）或 `handoff.txt`（纯文本 = feed）。
+  zburn 下一轮取走，排进 worker 的待执行队列；worker busy 时保留，不会丢。
+* **新对话**：`action=new_chat` 会点 ZCode 项目行的「新建任务」，输入首条指令，
+  并把新对话自动加入动态监控名单——所以后续「继续」会喂到新会话，不会一直困在旧上下文。
+* **dsh 必须带无障碍开关重启一次**（会打断正在跑的回合）：
+  `python zburn.py restart-app --config config.json --agent dsh --yes`，然后在面板「多 Agent」卡点「启用」。
+
+手动命令：`agents` / `newchat` / `handoff` / `supervise` / `snapshot`，详见
+[docs/多Agent监督.md](docs/多Agent监督.md)。
+
 ## 换一个应用也能用
 
 zburn 不认死 ZCode，只认「无障碍树里的控件形状」：
@@ -221,10 +254,16 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 | `status [--follow]` | 看 status.json、心跳、最近日志 |
 | `probe [--filter] [--json]` | 导出目标窗口无障碍树（换应用第一件事） |
 | `inject --text "…" [--dry-run] [--no-enter]` | 直接往输入框投一条 |
-| `feed [--dry-run] [--prompt "…"]` | 投喂一轮 |
-| `run [--dry-run]` | 守护循环（保活/网关/额度/投喂/状态） |
+| `feed [--dry-run] [--prompt "…"] [--agent id]` | 投喂一轮 |
+| `run [--dry-run]` | 守护循环（多 agent 调度 / 保活 / 网关 / 额度 / 交接） |
+| `agents` | 列出 agent、角色、监控数、待执行交接 |
+| `newchat --agent zcode --prompt "…"` | 新建对话并投递首条指令（`--dry-run` 只定位） |
+| `handoff --action feed\|new_chat` | 手动写一份监督交接 |
+| `handoff --list / --apply` | 看 / 执行桥里的交接 |
+| `supervise [--wait 120]` | 立刻唤醒 supervisor 验收 |
+| `snapshot [--agent zcode]` | 导出 worker 对话尾部（调试监督上下文） |
 | `watchdog` | 心跳超时拉起 run |
-| `restart-app [--yes]` | 带 `--force-renderer-accessibility` 重启目标应用（修「无障碍树为空」） |
+| `restart-app [--agent id] [--yes]` | 带 `--force-renderer-accessibility` 重启目标应用（修「无障碍树为空」） |
 | `panel` / `up` | 起可视化面板 / 一键全起（网关+守护+看门狗+面板） |
 | `gateway` | 只探活，必要时按配置拉起网关（绝不重启） |
 | `token` | 生成面板 token |
@@ -242,14 +281,21 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 .zburn/hook.log             插件钩子日志
 .zburn/continue.enabled     插件开关（存在才续派）
 .zburn/next-prompt.txt      当前要发的指令（人肉可读，可手改）
+.zburn/agents/*.json        每个 agent 的最近状态（last_feed / last_result / pending …）
+.zburn/agents/*.targets.json 新对话自动加入的动态监控名单
+.zburn/handoffs/            已消费的监督交接归档
+%LOCALAPPDATA%/zburn-bridge/ 监督桥（context/status/handoff，给 dsh 读写）
 ```
 
 ## 目录
 
 ```
 zburn.py                    CLI 主程序（doctor/quota/status/probe/inject/feed/run/watchdog/plugin）
+agents.py                   多 agent 配置归一化 / 动态监控名单 / 监督交接协议
+zsession.py                 从 ZCode SQLite 提取真实会话（给 supervisor 看）
 scripts/
   inject-uia.ps1            锁屏注入器（内容比对 + 只补后缀 + Invoke 提交）
+  new-chat.ps1              新建对话并投递首条指令（点项目行的「新建任务」）
   feed-sessions.ps1         多会话批量投喂（busy/queued 自动跳过）
   uia-tree.ps1              无障碍树导出
   probe-edits.ps1           列出所有 Edit（定位真正的输入框）
@@ -258,14 +304,21 @@ scripts/
   ensure-gateway.ps1        网关探活/必要时启动（不重启）
 plugin/zcode-continue/      Stop 钩子插件（额度没烧完就自动续派）
 config.example.json         配置样例
-docs/                       原理 / 配置 / 排查
+docs/                       原理 / 配置 / 排查 / 多 Agent 监督
 ```
 
 ## 已知限制
 
 - **Windows only**：UIA + PostMessage 是 Win32 那套；mac/Linux 需要换 AXAPI / AT-SPI 实现。
 - **只能投 ASCII**：中文指令会被丢弃（WM_CHAR 的硬限制），要发中文得换剪贴板 + 粘贴方案（锁屏下不可靠）。
-- **退格无效**：输入框里有残留文本时 zburn 不会强行追加，而是跳过并报 `exit 7`；需要人工清一次。
+  监督交接的 `prompt` 也必须是 ASCII；`context.txt` 可以是中文（走文件，不走 WM_CHAR）。
+- **dsh 第一次接入要重启一次**：Electron 不带 `--force-renderer-accessibility` 时 UIA 读不到聊天区；
+  `python zburn.py restart-app --agent dsh --yes` 会打断 dsh 正在跑的回合。
+- **新对话要求项目的「新建任务」按钮在侧栏可见**：滚出可视区时 zburn 会拒绝点击并提示，
+  不会点空后把字打进当前对话；`new_chat.allow_offscreen: true` 只给排障用。
+- **退格无效**：输入框里有残留文本时 zburn 不会强行追加，而是跳过并报 `exit 7`。
+  可以先试 `pwsh -File scripts/clear-composer.ps1`（它会试 `ValuePattern.SetValue`，ZCode 某些输入框可写）；
+  新对话默认**不会**自动清空，避免把另一个任务正在用的草稿抹掉。
 - 无头/锁屏环境下拿不到 GPU 加速的窗口内容，所以不做截图校验，只看控件状态。
 - 无障碍树在长时间锁屏后可能被 Chromium 关闭，`run` 会自动重启应用（会打断正在生成的会话，权衡后选了"能继续跑"）。
   **应用必须带 `--force-renderer-accessibility` 启动**（已写进 `config.app.start_args`），否则锁屏久了 a11y 会被关掉、UIA 读到空树；
