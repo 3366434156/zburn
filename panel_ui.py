@@ -64,12 +64,12 @@ h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
   display:flex;align-items:center;gap:8px}
 .card>h2 span{color:var(--dim2);font-weight:500;letter-spacing:0;text-transform:none}
 .rows{display:grid;gap:2px}
-.row{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:9px;padding:8px 0;border-bottom:1px dashed rgba(36,48,64,.7);min-width:0}
+.row{display:block;padding:8px 0;border-bottom:1px dashed rgba(36,48,64,.7);min-width:0}
 .row:last-child{border-bottom:0}
-.row .k{color:var(--dim);font-size:13px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.row .v{font-weight:600;font-size:13.5px;text-align:right;min-width:0;max-width:52vw;
+.row .k{color:var(--dim);font-size:11.5px;display:block}
+.row .v{font-weight:600;font-size:14px;display:block;text-align:left;max-width:100%;
   white-space:normal;overflow-wrap:anywhere}
-.dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;background:var(--dim2)}
+.dot{display:none}
 .dot.ok{background:var(--ok);box-shadow:0 0 8px rgba(63,185,80,.6)}
 .dot.bad{background:var(--bad);box-shadow:0 0 8px rgba(248,81,73,.5)}
 .dot.warn{background:var(--warn);box-shadow:0 0 8px rgba(210,153,34,.5)}
