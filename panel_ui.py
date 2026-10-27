@@ -67,7 +67,7 @@ h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
 .row{display:block;padding:8px 0;border-bottom:1px dashed rgba(36,48,64,.7);min-width:0}
 .row:last-child{border-bottom:0}
 .row .k{color:var(--dim);font-size:11.5px;display:block}
-.row .v{font-weight:600;font-size:14px;display:block;text-align:left;max-width:100%;
+.row .v{font-weight:600;font-size:14px;display:block;text-align:left;max-width:100%;word-break:break-all;
   white-space:normal;overflow-wrap:anywhere}
 .dot{display:none}
 .dot.ok{background:var(--ok);box-shadow:0 0 8px rgba(63,185,80,.6)}
