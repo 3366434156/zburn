@@ -54,7 +54,9 @@ DEFAULT_CONFIG = {
     "app": {
         "process_name": "ZCode",
         "exe": r"E:\exe\Zcode\ZCode.exe",
-        "start_args": [],
+        # 必须带这个开关：不带的话 Chromium 只在有辅助技术时才开无障碍树，
+        # 锁屏久了会把 a11y 关掉，UIA 就什么都读不到（这是熄屏注入的前提）。
+        "start_args": ["--force-renderer-accessibility"],
         # Electron 应用被这些环境变量污染会直接退出（实测 ELECTRON_RUN_AS_NODE 会让 ZCode 秒退）
         "strip_env": ["ELECTRON_RUN_AS_NODE", "ELECTRON_NO_ATTACH_CONSOLE"],
         "start_if_down": True,
@@ -96,7 +98,7 @@ DEFAULT_CONFIG = {
     },
     "paths": {"state_dir": ".zburn", "stop_file": "STOP"},
     "watchdog": {"heartbeat_stale_seconds": 420, "check_seconds": 30},
-    "panel": {"host": "127.0.0.1", "port": 8788, "token": "", "autostart": False},
+    "panel": {"host": "127.0.0.1", "port": 8790, "token": "", "autostart": False},
 }
 
 
@@ -312,6 +314,18 @@ def _sum_remaining(obj) -> int | None:
     return total
 
 
+def quota_headers(q: dict) -> dict:
+    """管理接口的鉴权头：不同版本 zcode2api 认不同的写法，两个都带上最省事。
+
+    v2.6 及更早：x-admin-key: <key>
+    v2.7 起：    Authorization: Bearer <key>
+    """
+    key = (q or {}).get("admin_key") or ""
+    if not key:
+        return {}
+    return {"x-admin-key": key, "Authorization": f"Bearer {key}"}
+
+
 def read_quota(cfg: dict) -> int | None:
     q = cfg["quota"]
     prov = q.get("provider", "none")
@@ -325,9 +339,7 @@ def read_quota(cfg: dict) -> int | None:
         m = re.search(r"(\d[\d,]{3,})", out or "")
         return int(m.group(1).replace(",", "")) if m else None
     if prov == "gateway_zcode2api":
-        headers = {}
-        if q.get("admin_key"):
-            headers["x-admin-key"] = q["admin_key"]
+        headers = quota_headers(q)
         try:
             data = http_json(q["url"], headers=headers)
         except Exception:
@@ -340,9 +352,7 @@ def refresh_quota(cfg: dict) -> bool:
     q = cfg["quota"]
     if q.get("provider") != "gateway_zcode2api" or not q.get("refresh_url"):
         return False
-    headers = {}
-    if q.get("admin_key"):
-        headers["x-admin-key"] = q["admin_key"]
+    headers = quota_headers(q)
     try:
         http_json(q["refresh_url"], method="POST", body=q.get("refresh_body") or {}, headers=headers)
         return True
@@ -473,6 +483,10 @@ def cmd_doctor(a) -> int:
     if ok_app:
         ok_uia, why = uia_ok(cfg)
         print(f"[{'OK ' if ok_uia else 'FAIL'}] 无障碍树可用：{why}")
+        if not ok_uia:
+            print("     树是空的 → 应用启动时没带 --force-renderer-accessibility。")
+            print(f"     关掉 {cfg['app']['process_name']} 后用 zburn 拉起（会带上这个开关）：")
+            print("       python zburn.py restart-app --config config.json")
         print(f"[{'锁屏' if desktop_locked() else '解锁'}] 当前桌面状态（锁屏走 UIA 路径，本来就没问题）")
 
     g = cfg["gateway"]
@@ -724,7 +738,8 @@ def cmd_panel(a) -> int:
     st = State(cfg)
     pc = cfg.get("panel") or {}
     host = a.host or pc.get("host") or "127.0.0.1"
-    port = a.port or int(pc.get("port") or 8788)
+    port = a.port or int(pc.get("port") or 8790)
+    port = panel.pick_port(host, port)          # 端口被别的程序占了就自动往后挪
     token = a.token if a.token is not None else panel_token(cfg, st, host)
     url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/" + (f"?token={token}" if token else "")
     print("zburn 面板已启动：")
@@ -762,7 +777,8 @@ def cmd_up(a) -> int:
         print("看门狗: 已启动")
 
     host = a.host or pc.get("host") or "0.0.0.0"
-    port = a.port or int(pc.get("port") or 8788)
+    port = a.port or int(pc.get("port") or 8790)
+    port = panel.pick_port(host, port)          # 端口被别的程序占了就自动往后挪
     token = a.token if a.token is not None else panel_token(cfg, st, host)
     url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/" + (f"?token={token}" if token else "")
     print("面板: 已启动")
@@ -770,6 +786,40 @@ def cmd_up(a) -> int:
     if not a.no_browser:
         open_browser(url)
     return panel.serve(cfg, host=host, port=port, token=token, config_path=a.config)
+
+
+def cmd_restart_app(a) -> int:
+    """带 --force-renderer-accessibility 重启应用：修「无障碍树为空」。
+
+    锁屏久了 Chromium 会把 a11y 关掉，之后 UIA 读不到任何控件；只有带开关重启应用
+    才能恢复。会打断应用里正在跑的任务，所以默认要确认一次。
+    """
+    cfg = load_config(a.config)
+    st = State(cfg)
+    name = cfg["app"]["process_name"]
+    if not app_running(cfg):
+        ok, msg = start_app(cfg)
+        print(f"应用没在跑，直接拉起：{msg}")
+        return 0 if ok else 1
+    if not a.yes:
+        print(f"要重启 {name}（会打断里面正在跑的任务）。确认请输入 yes：", end=" ", flush=True)
+        try:
+            ans = input().strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes", "是"):
+            print("已取消。")
+            return 1
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    subprocess.run(["taskkill", "/IM", f"{name}.exe", "/F"], capture_output=True, creationflags=flags)
+    st.log(f"[restart-app] 已结束 {name}，准备带 a11y 开关重启")
+    time.sleep(3)
+    ok, msg = start_app(cfg)
+    print(f"重启：{msg}")
+    time.sleep(8)
+    ok_uia, why = uia_ok(cfg)
+    print(f"[{'OK ' if ok_uia else 'FAIL'}] 无障碍树：{why}")
+    return 0 if ok_uia else 1
 
 
 def cmd_panel_token(a) -> int:
@@ -842,6 +892,11 @@ def main(argv: list[str] | None = None) -> int:
     gp.set_defaults(func=cmd_gateway)
 
     sub.add_parser("token", help="生成面板 token").set_defaults(func=cmd_panel_token)
+
+    rp = sub.add_parser("restart-app", help="带无障碍开关重启目标应用（修 a11y 树为空）")
+    rp.add_argument("--config", default=__import__("argparse").SUPPRESS)
+    rp.add_argument("--yes", action="store_true", help="不问直接重启（会打断应用里正在跑的任务）")
+    rp.set_defaults(func=cmd_restart_app)
 
     a = ap.parse_args(argv)
     return a.func(a)

@@ -28,6 +28,7 @@ header{position:sticky;top:0;z-index:20;backdrop-filter:blur(14px);
   background:rgba(13,17,23,.82);border-bottom:1px solid var(--line);
   padding:14px 16px calc(12px + env(safe-area-inset-top))}
 .hrow{display:flex;align-items:center;gap:10px;min-width:0}
+.hrow h1,.hrow .sub{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .logo{width:30px;height:30px;border-radius:9px;flex:0 0 auto;
   background:linear-gradient(145deg,#2f81f7,#a371f7);box-shadow:0 4px 14px rgba(47,129,247,.45);
   display:grid;place-items:center;font-size:15px}
@@ -57,11 +58,11 @@ h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
 .spark svg{display:block;width:100%;height:44px}
 
 /* ---------- 卡片 ---------- */
-.wrap{padding:14px 16px 0;display:grid;gap:12px}
+.wrap{padding:14px 16px 0;display:grid;gap:12px;grid-template-columns:minmax(0,1fr)}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);
   padding:14px;min-width:0;overflow:hidden}
 .card>h2{margin:0 0 10px;font-size:12px;color:var(--dim);font-weight:650;letter-spacing:.09em;text-transform:uppercase;
-  display:flex;align-items:center;gap:8px}
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
 .card>h2 span{color:var(--dim2);font-weight:500;letter-spacing:0;text-transform:none}
 .rows{display:grid;gap:2px}
 .row{display:block;padding:8px 0;border-bottom:1px dashed rgba(36,48,64,.7);min-width:0}
@@ -76,7 +77,7 @@ h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
 
 /* ---------- 表单 ---------- */
 label{display:block;font-size:12px;color:var(--dim);margin:12px 0 6px}
-input,textarea,select{width:100%;background:#0d1219;border:1px solid var(--line);border-radius:10px;
+input,textarea,select{width:100%;min-width:0;background:#0d1219;border:1px solid var(--line);border-radius:10px;
   color:var(--fg);padding:11px 12px;font:13.5px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;
   transition:border-color .15s,box-shadow .15s}
 input:focus,textarea:focus{outline:0;border-color:var(--acc);box-shadow:0 0 0 3px rgba(47,129,247,.18)}
@@ -94,7 +95,19 @@ textarea{min-height:72px;resize:vertical}
 .btn.danger{background:linear-gradient(180deg,#da3633,#b62324);border-color:#f85149;color:#fff}
 .btn.ghost{background:transparent}
 .btn.sm{min-height:36px;padding:8px 12px;font-size:13px;width:auto}
-.btnrow{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.btnrow{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px}
+.g3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.g2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+@media(max-width:560px){.g3,.g2{grid-template-columns:minmax(0,1fr)}}
+
+/* ---------- 高级配置折叠 ---------- */
+details{border:1px solid var(--line);border-radius:12px;background:#0f141b;padding:0 12px;margin-top:10px}
+details[open]{padding-bottom:12px}
+summary{cursor:pointer;list-style:none;padding:11px 0;color:var(--acc2);font-size:13px;font-weight:600;
+  display:flex;align-items:center;gap:8px}
+summary::-webkit-details-marker{display:none}
+summary:before{content:"▸";color:var(--dim);transition:transform .18s}
+details[open] summary:before{transform:rotate(90deg)}
 
 /* ---------- 日志 ---------- */
 .logbox{background:#0a0e13;border:1px solid var(--line);border-radius:12px;overflow:hidden}
@@ -107,9 +120,10 @@ pre#log{margin:0;padding:12px;max-height:42vh;overflow:auto;font:11.5px/1.6 ui-m
 /* ---------- 底部吸附操作条 ---------- */
 .dock{position:fixed;left:0;right:0;bottom:0;z-index:30;padding:10px 16px calc(10px + env(safe-area-inset-bottom));
   background:linear-gradient(180deg,rgba(13,17,23,.6),rgba(13,17,23,.96));backdrop-filter:blur(14px);
-  border-top:1px solid var(--line);display:grid;grid-template-columns:1.25fr 1fr 1fr 1fr;gap:8px}
-.dock .btn{min-height:44px;padding:0 8px;font-size:13px}
+  border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.dock .btn{min-height:44px;padding:0 6px;font-size:13px;min-width:0;white-space:nowrap}
 .dock .btn span.ico{font-size:15px}
+@media(max-width:380px){.dock .btn span.ico{display:none}}
 
 /* ---------- 提示 ---------- */
 .toast{position:fixed;left:50%;bottom:calc(92px + env(safe-area-inset-bottom));transform:translate(-50%,8px);
@@ -228,9 +242,9 @@ input:hover,textarea:hover{border-color:#2c3a4d}
 
   <div class="card span2">
     <h2>参数 <span>改完下一轮生效</span></h2>
-    <div style="display:grid;gap:0 14px;grid-template-columns:1fr">
+    <div style="display:grid;gap:0 14px;grid-template-columns:minmax(0,1fr)">
       <div><label>会话名正则（只喂匹配的会话）</label><input id="cfgSession" placeholder="Supervisor:|项目名"></div>
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+      <div class="g3">
         <div><label>间隔(秒)</label><input id="cfgInterval" type="number" min="20" step="10"></div>
         <div><label>并发上限</label><input id="cfgMax" type="number" min="1" max="12"></div>
         <div><label>额度阈值</label><input id="cfgStop" type="number" min="0" step="100000"></div>
@@ -238,6 +252,33 @@ input:hover,textarea:hover{border-color:#2c3a4d}
     </div>
     <div class="btnrow" style="grid-template-columns:1fr">
       <button class="btn" onclick="saveCfg()">保存参数</button>
+    </div>
+  </div>
+
+  <div class="card span2">
+    <h2>高级配置 <span>写进 config.json，改前自动留 .bak</span></h2>
+    <div class="rows">
+      <div class="row"><span class="k">配置文件</span><span class="v" id="vCfgPath">—</span></div>
+      <div class="row"><span class="k">面板地址</span><span class="v" id="vPanelUrl">—</span></div>
+    </div>
+    <details>
+      <summary>展开：应用 / 网关 / 额度接口</summary>
+      <label>应用进程名</label><input id="cfgProc" placeholder="ZCode">
+      <label>应用 exe 路径</label><input id="cfgExe" placeholder="E:\exe\Zcode\ZCode.exe">
+      <label>网关健康检查地址</label><input id="cfgHealth" placeholder="http://127.0.0.1:3000/meta">
+      <label>网关启动命令（网关挂了自动拉起）</label><input id="cfgStart" placeholder="python cli.py serve --port 3000">
+      <label>网关工作目录</label><input id="cfgWorkdir" placeholder="E:\数据\AI\zcode2api">
+      <label>额度接口</label><input id="cfgQuotaUrl" placeholder="http://127.0.0.1:3000/admin/api/accounts">
+      <label>额度管理密钥</label><input id="cfgAdminKey" placeholder="zcode">
+      <label>发送按钮正则</label><input id="cfgSendRegex" placeholder="发送|加入队列|Send">
+      <div class="g2">
+        <div><label>面板监听地址</label><input id="cfgHost" placeholder="127.0.0.1 或 0.0.0.0"></div>
+        <div><label>面板端口</label><input id="cfgPort" type="number" min="1" max="65535"></div>
+      </div>
+      <div class="hint">面板监听/端口改完要重启面板才生效（关掉窗口后重新双击 一键启动.bat）。</div>
+    </details>
+    <div class="btnrow" style="grid-template-columns:1fr">
+      <button class="btn" onclick="saveCfg()">保存高级配置</button>
     </div>
   </div>
 
@@ -291,14 +332,28 @@ async function savePrompt(){
        toast('指令已保存'); }catch(e){ toast('保存失败：'+e.message, true); }
 }
 async function saveCfg(){
+  const val = id => document.getElementById(id).value.trim();
   const body = {
-    session_regex: document.getElementById('cfgSession').value.trim(),
-    interval_seconds: +document.getElementById('cfgInterval').value,
-    max_sessions: +document.getElementById('cfgMax').value,
-    stop_below: +document.getElementById('cfgStop').value
+    session_regex: val('cfgSession'),
+    interval_seconds: +val('cfgInterval'),
+    max_sessions: +val('cfgMax'),
+    stop_below: +val('cfgStop'),
+    process_name: val('cfgProc'),
+    app_exe: val('cfgExe'),
+    health_url: val('cfgHealth'),
+    start_command: val('cfgStart'),
+    work_dir: val('cfgWorkdir'),
+    quota_url: val('cfgQuotaUrl'),
+    admin_key: val('cfgAdminKey'),
+    send_button_regex: val('cfgSendRegex'),
+    panel_host: val('cfgHost'),
+    panel_port: +val('cfgPort')
   };
-  try{ await api('/api/config', {method:'POST', body: JSON.stringify(body)}); toast('参数已保存'); }
-  catch(e){ toast('保存失败：'+e.message, true); }
+  Object.keys(body).forEach(k => { if(body[k]==='' || Number.isNaN(body[k])) delete body[k]; });
+  try{
+    const r = await api('/api/config', {method:'POST', body: JSON.stringify(body)});
+    toast(r.msg || '参数已保存'); setTimeout(load, 700);
+  }catch(e){ toast('保存失败：'+e.message, true); }
 }
 
 function drawSpark(hist){
@@ -353,10 +408,23 @@ async function load(){
   drawSpark(s.quota_history||[]);
 
   if(first){
-    document.getElementById('cfgSession').value = s.config.session_regex || '';
-    document.getElementById('cfgInterval').value = s.config.interval_seconds;
-    document.getElementById('cfgMax').value = s.config.max_sessions;
-    document.getElementById('cfgStop').value = s.config.stop_below;
+    const set = (id, v) => { const el = document.getElementById(id); if(el) el.value = (v===null||v===undefined)?'':v; };
+    set('cfgSession', s.config.session_regex);
+    set('cfgInterval', s.config.interval_seconds);
+    set('cfgMax', s.config.max_sessions);
+    set('cfgStop', s.config.stop_below);
+    set('cfgProc', s.config.process_name);
+    set('cfgExe', s.config.app_exe);
+    set('cfgHealth', s.config.health_url);
+    set('cfgStart', s.config.start_command);
+    set('cfgWorkdir', s.config.work_dir);
+    set('cfgQuotaUrl', s.config.quota_url);
+    set('cfgAdminKey', s.config.admin_key);
+    set('cfgSendRegex', s.config.send_button_regex);
+    set('cfgHost', s.config.panel_host);
+    set('cfgPort', s.config.panel_port);
+    document.getElementById('vCfgPath').textContent = s.config.config_path || '—';
+    document.getElementById('vPanelUrl').textContent = location.origin + '/?token=…';
     api('/api/prompt').then(t=>{ document.getElementById('prompt').value = t; }).catch(()=>{});
     first = false;
   }

@@ -92,8 +92,59 @@ class Supervisor:
         return True, "已请求停止"
 
 
+# ------------------------------------------------------------------ 配置字段
+# 面板上能改的字段：扁平名 -> (配置里的路径, 类型)
+CONFIG_FIELDS: dict[str, tuple[tuple[str, str], type]] = {
+    "process_name": (("app", "process_name"), str),
+    "app_exe": (("app", "exe"), str),
+    "session_regex": (("uia", "session_regex"), str),
+    "send_button_regex": (("uia", "send_button_regex"), str),
+    "interval_seconds": (("feed", "interval_seconds"), int),
+    "max_sessions": (("feed", "max_sessions"), int),
+    "health_url": (("gateway", "health_url"), str),
+    "start_command": (("gateway", "start_command"), str),
+    "work_dir": (("gateway", "work_dir"), str),
+    "quota_url": (("quota", "url"), str),
+    "admin_key": (("quota", "admin_key"), str),
+    "stop_below": (("quota", "stop_below"), int),
+    "panel_host": (("panel", "host"), str),
+    "panel_port": (("panel", "port"), int),
+}
+
+
+def apply_config_body(cur: dict, body: dict) -> tuple[dict, list[str]]:
+    """把面板提交的扁平字段写进配置结构，返回 (新配置, 提示列表)。"""
+    import re
+    notes: list[str] = []
+    for flat, value in body.items():
+        spec = CONFIG_FIELDS.get(flat)
+        if not spec:
+            continue
+        (sec, key), typ = spec
+        if typ is int:
+            try:
+                value = int(str(value).strip() or 0)
+            except ValueError:
+                notes.append(f"{flat} 不是数字，已忽略")
+                continue
+        else:
+            value = str(value)
+        if flat == "session_regex":
+            try:
+                re.compile(value)
+            except re.error as e:
+                notes.append(f"会话正则写错了（{e}），已忽略")
+                continue
+        if flat == "panel_port" and not (1 <= value <= 65535):
+            notes.append("端口要在 1-65535 之间，已忽略")
+            continue
+        cur.setdefault(sec, {})[key] = value
+    return cur, notes
+
+
 # ------------------------------------------------------------------ 状态汇总
-def collect(cfg: dict, st, sup: Supervisor, tail: int = 120) -> dict:
+def collect(cfg: dict, st, sup: Supervisor, tail: int = 120,
+            config_path: str | None = None) -> dict:
     import zburn  # 延迟导入，避免循环
 
     status = {}
@@ -155,12 +206,22 @@ def collect(cfg: dict, st, sup: Supervisor, tail: int = 120) -> dict:
         "logs": logs,
         "config": {
             "process_name": cfg["app"]["process_name"],
+            "app_exe": cfg["app"].get("exe", ""),
             "session_regex": cfg["uia"]["session_regex"],
+            "send_button_regex": cfg["uia"].get("send_button_regex", ""),
             "max_sessions": cfg["feed"]["max_sessions"],
             "interval_seconds": cfg["feed"]["interval_seconds"],
             "stop_below": cfg["quota"]["stop_below"],
             "providers": cfg["quota"]["provider"],
             "prompt_file": cfg["prompt"].get("file"),
+            "health_url": cfg["gateway"].get("health_url", ""),
+            "start_command": cfg["gateway"].get("start_command", ""),
+            "work_dir": cfg["gateway"].get("work_dir", ""),
+            "quota_url": cfg["quota"].get("url", ""),
+            "admin_key": cfg["quota"].get("admin_key", ""),
+            "panel_host": (cfg.get("panel") or {}).get("host", "127.0.0.1"),
+            "panel_port": (cfg.get("panel") or {}).get("port", 8788),
+            "config_path": config_path or "<内置默认>",
         },
     }
 
@@ -211,7 +272,7 @@ def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token:
             if not self._authorized():
                 return self._json(401, {"error": "unauthorized"})
             if u.path == "/api/state":
-                return self._json(200, collect(cfg, st, sup))
+                return self._json(200, collect(cfg, st, sup, config_path=config_path))
             if u.path == "/api/prompt":
                 p = pathlib.Path(cfg["prompt"].get("file") or "next-prompt.txt")
                 if not p.is_absolute():
@@ -262,26 +323,28 @@ def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token:
                 st.log(f"[panel] 指令已更新：{text[:60]}…")
                 return self._json(200, {"ok": True, "msg": "指令已保存"})
             if u.path == "/api/config":
-                if config_path:
-                    cp = pathlib.Path(config_path)
-                    cur = json.loads(cp.read_text(encoding="utf-8")) if cp.exists() else {}
-                else:
-                    cur = {}
-                if "session_regex" in body:
-                    cur.setdefault("uia", {})["session_regex"] = body["session_regex"]
-                if "interval_seconds" in body:
-                    cur.setdefault("feed", {})["interval_seconds"] = int(body["interval_seconds"])
-                if "max_sessions" in body:
-                    cur.setdefault("feed", {})["max_sessions"] = int(body["max_sessions"])
-                if "stop_below" in body:
-                    cur.setdefault("quota", {})["stop_below"] = int(body["stop_below"])
-                if config_path:
+                cp = pathlib.Path(config_path) if config_path else None
+                cur = {}
+                if cp and cp.exists():
+                    try:
+                        cur = json.loads(cp.read_text(encoding="utf-8"))
+                    except Exception as e:
+                        return self._json(500, {"ok": False, "msg": f"配置读不出来：{e}"})
+                cur, notes = apply_config_body(cur, body)
+                if cp:
+                    if cp.exists():          # 留一份上一版，改坏了能手动还原
+                        try:
+                            (cp.parent / (cp.name + ".bak")).write_text(
+                                cp.read_text(encoding="utf-8"), encoding="utf-8")
+                        except OSError:
+                            pass
                     cp.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
-                    # 热更新内存配置（下一轮 run 会重新读到文件，面板自己也立刻生效）
-                    import importlib
-                    importlib.reload(zerun_stub(cfg, cur))
-                st.log(f"[panel] 参数已更新：{body}")
-                return self._json(200, {"ok": True, "msg": "参数已保存（守护进程下轮生效）"})
+                    zerun_stub(cfg, cur)     # 面板自身立刻生效；守护进程下轮读文件
+                st.log(f"[panel] 参数已更新：{json.dumps(body, ensure_ascii=False)[:200]}")
+                msg = "参数已保存" + ("（守护进程下一轮生效）" if sup.alive() else "")
+                if notes:
+                    msg += "；" + "；".join(notes)
+                return self._json(200, {"ok": True, "msg": msg, "notes": notes})
             return self._json(404, {"error": "not found"})
 
     return Handler
@@ -297,17 +360,35 @@ def zerun_stub(cfg: dict, over: dict):
     return sys.modules[__name__]
 
 
+def pick_port(host: str, port: int, tries: int = 20) -> int:
+    """端口被占用就往后找一个能绑的：绝不抢别人的端口，也绝不让面板起不来。"""
+    import socket
+    for p in range(port, port + tries):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((host, p))
+            return p
+        except OSError:
+            continue
+        finally:
+            s.close()
+    return port
+
+
 def serve(cfg: dict, *, host: str, port: int, token: str, config_path: str | None) -> int:
     from zburn import State
 
     st = State(cfg)
+    port = pick_port(host, port)
     st.log(f"[panel] 面板启动 http://{host}:{port}/  鉴权={'token' if token else '仅本机'}")
     sup = Supervisor(cfg, st.dir, config_path)
     handler = make_handler(cfg, st, sup, config_path, token)
-    srv = ThreadingHTTPServer((host, port), handler)
-    print(f"zburn 面板: http://{host}:{port}/" + (f"?token={token}" if token else ""))
-    print("手机/别的电脑访问：把 host 设成 0.0.0.0，并用 --token 保护；" 
-          "局域网地址 = 本机 IP + 端口。")
+    try:
+        srv = ThreadingHTTPServer((host, port), handler)
+    except OSError as e:
+        print(f"面板启动失败：{host}:{port} 绑不上（{e}）。换个端口：--port 8791")
+        return 1
+    print(f"zburn 面板已就绪: http://127.0.0.1:{port}/" + (f"?token={token}" if token else ""))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

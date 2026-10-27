@@ -2,7 +2,7 @@
   "app": {
     "process_name": "ZCode",
     "exe": "E:\\exe\\Zcode\\ZCode.exe",
-    "start_args": [],
+    "start_args": ["--force-renderer-accessibility"],
     "strip_env": ["ELECTRON_RUN_AS_NODE"],
     "start_if_down": true
   },
@@ -50,5 +50,10 @@
   "watchdog": {
     "heartbeat_stale_seconds": 420,
     "check_seconds": 30
+  },
+  "panel": {
+    "host": "0.0.0.0",
+    "port": 8790,
+    "token": ""
   }
 }

@@ -87,30 +87,46 @@ python zburn.py up --config config.json
 
 ## 可视化面板（手机 / 别的电脑都能开）
 
-![面板](docs/panel.png)
+![面板](docs/panel-desktop.png)
 
 一条命令起来，一个页面管全部 —— 不用记命令：
 
 ```powershell
-python zburn.py panel --config config.json                 # 只在本机看
+python zburn.py panel --config config.json                 # 只在本机看（默认 8790）
 python zburn.py token                                      # 生成随机 token
-python zburn.py panel --config config.json --host 0.0.0.0 --port 8788 --token <token>
-#   手机浏览器: http://<这台机器的局域网IP>:8788/?token=<token>
+python zburn.py panel --config config.json --host 0.0.0.0 --port 8790 --token <token>
+#   手机浏览器: http://<这台机器的局域网IP>:8790/?token=<token>
 
 python zburn.py up --config config.json --host 0.0.0.0 --token <token>   # 守护+看门狗+面板 一条全起
 ```
 
+> 端口被别的程序占了（比如别的网关也在 8788），面板会**自动往后顺延**到第一个空闲端口，
+> 并在启动时把真实地址打印出来 —— 不会因为端口冲突起不来，也不会去抢别人的端口。
+
 | 区域 | 能干什么 |
 |---|---|
 | 状态卡 | 守护是否在跑 / 心跳多久前 / 第几轮 / 上次投喂结果 / 额度与阈值 / 应用·锁屏·网关状态 |
-| 大按钮 | **启动守护** · **停止** · **投喂一轮** · **拉起网关** · 刷新 |
+| 大按钮 | **启动守护** · **停止** · **投喂一轮** · **拉起网关** |
 | 当前指令 | 直接改下一轮要发的话（写进 next-prompt.txt，插件读同一份） |
 | 参数 | 会话正则 · 巡检间隔 · 并发上限 · 额度阈值（改完下一轮生效） |
+| 高级配置 | 应用进程名/exe · 网关健康地址/启动命令/工作目录 · 额度接口与管理密钥 · 发送按钮正则 · 面板监听与端口（写回 `config.json`，改前自动留 `.bak`） |
 | 日志 | 最近 120 行，3 秒自动刷新 |
-| 额度曲线 | 每轮额度落点的迷你柱状图 |
+| 额度曲线 | 每轮额度落点的迷你折线 |
+
+### 配置在哪改
+
+三条路，随便挑一条：
+
+1. **面板「参数」卡**：日常那几个（会话正则、间隔、并发、阈值），改完点保存，守护进程下一轮生效。
+2. **面板「高级配置」卡**：应用/网关/额度接口/端口这些，展开填完点保存，直接写回 `config.json`（先备份 `.bak`）。正则写错、端口非法会被挡下来并提示，不会把配置写坏。
+3. **直接编辑 `config.json`**：字段含义见 [docs/配置说明.md](docs/配置说明.md)，`config.example.json` 是带注释的模板。
+
+手机上看就是这样：
+
+<img src="docs/panel-mobile.png" width="360" alt="手机端面板">
 
 安全：默认只监听 `127.0.0.1`；`--host 0.0.0.0` 时必须给 `--token`，否则非本机请求一律 401。
-更稳的远程方式：Tailscale/ZeroTier 组内网，或 `ssh -L 8788:127.0.0.1:8788` 端口转发（面板不用对外开端口）。
+更稳的远程方式：Tailscale/ZeroTier 组内网，或 `ssh -L 8790:127.0.0.1:8790` 端口转发（面板不用对外开端口）。
 
 ## 三种跑法，按场景选
 
@@ -191,6 +207,10 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 | `feed [--dry-run] [--prompt "…"]` | 投喂一轮 |
 | `run [--dry-run]` | 守护循环（保活/网关/额度/投喂/状态） |
 | `watchdog` | 心跳超时拉起 run |
+| `restart-app [--yes]` | 带 `--force-renderer-accessibility` 重启目标应用（修「无障碍树为空」） |
+| `panel` / `up` | 起可视化面板 / 一键全起（网关+守护+看门狗+面板） |
+| `gateway` | 只探活，必要时按配置拉起网关（绝不重启） |
+| `token` | 生成面板 token |
 | `plugin install\|remove` | 安装/卸载自动继续插件 |
 
 ## 状态与日志
@@ -231,6 +251,8 @@ docs/                       原理 / 配置 / 排查
 - **退格无效**：输入框里有残留文本时 zburn 不会强行追加，而是跳过并报 `exit 7`；需要人工清一次。
 - 无头/锁屏环境下拿不到 GPU 加速的窗口内容，所以不做截图校验，只看控件状态。
 - 无障碍树在长时间锁屏后可能被 Chromium 关闭，`run` 会自动重启应用（会打断正在生成的会话，权衡后选了"能继续跑"）。
+  **应用必须带 `--force-renderer-accessibility` 启动**（已写进 `config.app.start_args`），否则锁屏久了 a11y 会被关掉、UIA 读到空树；
+  已经开着但树是空的，用 `python zburn.py restart-app --config config.json` 带开关重启一次即可。
 
 ## License
 

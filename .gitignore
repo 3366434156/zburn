@@ -3,6 +3,7 @@
 STOP
 *.log
 config.json
+config.json.bak
 
 # Python
 __pycache__/
