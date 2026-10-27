@@ -140,11 +140,11 @@ function Get-SessionKey([string]$name) {
 }
 
 $all = Get-Controls -WithClass:($DryRun -and $Json)
-# 会话候选：侧栏里的 ListItem（名字非空、位于窗口左侧 45% 内）
+# 会话候选：侧栏里的列表项（ZCode 用 ListItem，DSH 用 TreeItem），名字非空、位于窗口左侧 45% 内
 $winW = ($all | Where-Object { $_.Type -eq 'ControlType.Window' -and $_.W -gt 600 } | Select-Object -First 1).W
 if (-not $winW) { $winW = 1920 }
 $sideItems = @($all | Where-Object {
-        $_.Type -eq 'ControlType.ListItem' -and $_.Name -and
+        ($_.Type -eq 'ControlType.ListItem' -or $_.Type -eq 'ControlType.TreeItem') -and $_.Name -and
         ($_.X -lt $winW * 0.45) -and $_.W -gt 40 -and $_.H -gt 12
     })
 foreach ($s in $sideItems) {

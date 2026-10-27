@@ -65,23 +65,27 @@ class Supervisor:
         于是面板显示"运行中"，点停止还会把应用杀掉）。所以还要核对可执行文件是不是 Python。
         """
         pid = self.pid()
-        if not pid:
-            return False
-        if os.name == "nt":
+        ok = False
+        if pid and os.name == "nt":
             exe = self._pid_image(pid)
-            if not exe:
-                return False
-            name = pathlib.Path(exe).name.lower()
-            return name.startswith("python") or exe.lower() == sys.executable.lower()
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
+            if exe:
+                name = pathlib.Path(exe).name.lower()
+                ok = name.startswith("python") or exe.lower() == sys.executable.lower()
+        elif pid:
+            try:
+                os.kill(pid, 0)
+                ok = True
+            except OSError:
+                ok = False
+        # 命令行直接起的 run（没写 pid 文件）也算在跑：看调度器锁
+        return ok or bool(self._other_scheduler())
 
     def start(self) -> tuple[bool, str]:
         if self.alive():
             return False, "已在运行"
+        stray = self._other_scheduler()
+        if stray:
+            return False, f"已有调度器在跑（{stray}），不会再起第二个；要重启请先点「停止」"
         self.stop_file.unlink(missing_ok=True)
         # --config 必须写在子命令前面，否则 argparse 会报 unrecognized arguments
         args = [sys.executable, str(pathlib.Path(__file__).resolve().parent / "zburn.py")]
@@ -99,6 +103,27 @@ class Supervisor:
                              startupinfo=startup or None)
         self.pid_file.write_text(str(p.pid))
         return True, f"已启动 pid={p.pid}"
+
+    def _other_scheduler(self) -> str:
+        """单调度器锁：没有 pid 文件但锁被别的活进程持有时，别硬起第二个。"""
+        import os as _os
+        lock = pathlib.Path(_os.environ.get("TEMP") or ".") / "zburn-scheduler.lock"
+        try:
+            parts = lock.read_text(errors="replace").strip().split()
+        except OSError:
+            return ""
+        if len(parts) < 2 or not parts[1].isdigit():
+            return ""
+        pid = int(parts[1])
+        if pid == (self.pid() or -1):
+            return ""
+        if _os.name == "nt":
+            r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True,
+                               text=True, errors="replace",
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if str(pid) not in (r.stdout or ""):
+                return ""
+        return f"{parts[0]} pid={pid}"
 
     def _kill_stray_daemons(self) -> int:
         """兜底：pid 文件对不上/缺失时，按命令行找「python … zburn.py … run」的守护进程，

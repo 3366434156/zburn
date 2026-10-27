@@ -496,6 +496,32 @@ def describe_selection(cfg: dict) -> str:
 NO_SELECTION_MSG = "未指定监控对话（监控名单为空且会话正则为空）→ 不投喂，去面板「会话监控」勾一下"
 
 
+def flush_composer(cfg: dict) -> None:
+    """把输入框里的残文「发出去」腾空。
+
+    ZCode / DSH 在 Electron 2.x 上对退格、Ctrl+A、ValuePattern.SetValue('') 全是空操作，
+    唯一可靠的办法是 Invoke 发送按钮。注入被截断时会留下半截指令，不清掉后面每次都失败。
+    """
+    try:
+        run_ps("flush-composer.ps1", {"ProcessName": cfg["app"]["process_name"]}, timeout=120)
+    except Exception:
+        pass
+
+
+def feed_clean(cfg: dict, st: State, prompt: str, dry_run: bool = False) -> tuple[int, str]:
+    """投喂的稳妥版：先腾空、失败再腾空重投一次。"""
+    if dry_run:
+        return feed_once(cfg, st, prompt, dry_run=True)
+    flush_composer(cfg)
+    code, summary = feed_once(cfg, st, prompt)
+    if code == 0 and "typed=0" not in str(summary) and "失败 1" not in str(summary):
+        return code, summary
+    st.log(f"[feed] 首次未成功（{summary}）→ 腾空输入框后重投")
+    flush_composer(cfg)
+    time.sleep(3)
+    return feed_once(cfg, st, prompt)
+
+
 def feed_once(cfg: dict, st: State, prompt: str, dry_run: bool = False) -> tuple[int, str]:
     targets = feed_targets(cfg)
     regex = (cfg["uia"].get("session_regex") or "").strip()
@@ -795,7 +821,7 @@ def supervise_now(cfg: dict, st: State, *, dry_run: bool = False, wait: int = 0)
     if dry_run:
         return 0, f"监督桥已刷新：{info['dir']}（dry-run，未唤醒）"
     sup_view = agentlib.agent_view(cfg, sup, st)
-    code, summary = feed_once(sup_view, st, prompt)
+    code, summary = feed_clean(sup_view, st, prompt)
     if code != 0:
         return code, f"唤醒 {sup['name']} 失败：{summary}"
     deadline = time.time() + max(0, wait)
@@ -845,7 +871,7 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
                                           project=pending.get("project", ""),
                                           dry_run=dry_run, agent_id=aid)
         else:
-            code, summary = feed_once(acfg, st, pending["prompt"], dry_run=dry_run)
+            code, summary = feed_clean(acfg, st, pending["prompt"], dry_run=dry_run)
         st.log(f"[{aid}] 执行交接 {action}：{summary}")
         agentlib.update_state(st, aid, last_run=now(), last_action=f"handoff:{action}",
                               last_result=summary,
@@ -860,7 +886,7 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
         work = work or spec
         prompt = build_supervisor_prompt(cfg, st, spec, work)
         info = write_supervisor_bridge(cfg, st, spec, work, prompt, remaining)
-        code, summary = feed_once(acfg, st, prompt, dry_run=dry_run)
+        code, summary = feed_clean(acfg, st, prompt, dry_run=dry_run)
         st.log(f"[{aid}] 监督唤醒：{summary}")
         agentlib.update_state(st, aid, last_run=now(), last_action="supervise",
                               last_result=summary, last_feed=now() if code == 0 else "")
@@ -870,7 +896,7 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
 
     # 3) worker：普通续派
     prompt = build_prompt(acfg, st, cycle, remaining)
-    code, summary = feed_once(acfg, st, prompt, dry_run=dry_run)
+    code, summary = feed_clean(acfg, st, prompt, dry_run=dry_run)
     st.log(f"[{aid}] 第 {cycle} 轮投喂：{summary}")
     agentlib.update_state(st, aid, last_run=now(), last_action="feed",
                           last_result=summary, last_feed=now() if code == 0 else "")
@@ -1111,7 +1137,7 @@ def cmd_feed(a) -> int:
     acfg = agentlib.agent_view(cfg, spec, st)
     prompt = a.prompt or build_prompt(acfg, st, 0, read_quota(cfg))
     st.log(f"[{spec['id']}] 投喂一轮（dry-run={a.dry_run}）指令: {prompt[:60]}…")
-    code, summary = feed_once(acfg, st, prompt, dry_run=a.dry_run)
+    code, summary = feed_clean(acfg, st, prompt, dry_run=a.dry_run)
     st.log("结果: " + (summary or f"exit {code}"))
     st.status(last_feed=now(), last_feed_summary=summary)
     agentlib.update_state(st, spec["id"], last_action="feed", last_result=summary,
