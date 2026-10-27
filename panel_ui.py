@@ -118,6 +118,37 @@ pre#log{margin:0;padding:12px;max-height:42vh;overflow:auto;font:11.5px/1.6 ui-m
 .toast.show{opacity:1;transform:translate(-50%,0)}
 .toast.err{background:#b62324;box-shadow:0 8px 24px rgba(182,35,36,.45)}
 
+
+/* ---------- 卡片动效 ---------- */
+.card{position:relative;transition:transform .18s cubic-bezier(.2,.7,.3,1),border-color .18s,box-shadow .18s}
+.card:before{content:"";position:absolute;left:14%;right:14%;top:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(88,166,255,.85),transparent);
+  opacity:.35;transition:opacity .18s,left .25s,right .25s}
+.card:hover{transform:translateY(-2px);border-color:rgba(88,166,255,.42);
+  box-shadow:0 14px 34px rgba(0,0,0,.5),0 0 0 1px rgba(88,166,255,.12)}
+.card:hover:before{opacity:1;left:6%;right:6%}
+.card>h2{transition:color .18s}
+.card:hover>h2{color:var(--acc2)}
+.hero{transition:box-shadow .25s,border-color .25s}
+.hero:hover{box-shadow:0 16px 40px rgba(31,111,235,.28),var(--sh);border-color:rgba(88,166,255,.35)}
+.hero:before{content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(115deg,transparent 30%,rgba(255,255,255,.06) 45%,transparent 60%);
+  transform:translateX(-60%);animation:sheen 6.5s ease-in-out infinite}
+@keyframes sheen{0%,70%{transform:translateX(-70%)}100%{transform:translateX(70%)}}
+.btn:hover{filter:brightness(1.08)}
+.btn.primary:hover{box-shadow:0 10px 26px rgba(47,129,247,.42)}
+.dot.ok{animation:dotpulse 2.4s ease-in-out infinite}
+@keyframes dotpulse{0%,100%{opacity:1}50%{opacity:.45}}
+input:hover,textarea:hover{border-color:#2c3a4d}
+@media(prefers-reduced-motion:reduce){.card,.hero,.hero:before,.dot.ok{transition:none;animation:none}}
+
+
+.gh{flex:0 0 auto;width:34px;height:34px;border-radius:10px;display:grid;place-items:center;
+  border:1px solid var(--line);background:#11161d;color:var(--dim);text-decoration:none;
+  transition:transform .15s,color .15s,border-color .15s,background .15s}
+.gh:hover{color:var(--fg);border-color:rgba(88,166,255,.5);background:#161d26;transform:translateY(-1px)}
+.gh svg{width:18px;height:18px;fill:currentColor}
+
 @media(min-width:720px){
   body{padding-bottom:24px}
   .wrap{grid-template-columns:1fr 1fr}
@@ -136,6 +167,17 @@ pre#log{margin:0;padding:12px;max-height:42vh;overflow:auto;font:11.5px/1.6 ui-m
       <div class="sub" id="subline">连接中…</div>
     </div>
     <div class="pill" id="runPill"><i></i><span>…</span></div>
+    <a class="gh" href="https://github.com/3366434156/zburn" target="_blank" rel="noreferrer"
+       title="在 GitHub 上查看 zburn" aria-label="GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
+      0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01
+      1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95
+      0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27
+      .68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15
+      0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8
+      c0-4.42-3.58-8-8-8z"/></svg>
+    </a>
+
   </div>
 </header>
 
