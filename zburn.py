@@ -837,7 +837,9 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
         p.set_defaults(func=fn)
 
-    sub.add_parser("gateway", help="只探活/必要时启动网关").set_defaults(func=cmd_gateway)
+    gp = sub.add_parser("gateway", help="只探活/必要时启动网关")
+    gp.add_argument("--config", default=None)
+    gp.set_defaults(func=cmd_gateway)
 
     sub.add_parser("token", help="生成面板 token").set_defaults(func=cmd_panel_token)
 

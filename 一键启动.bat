@@ -15,7 +15,7 @@ echo ============================================
 echo.
 
 if exist config.json (
-  python zburn.py up --config config.json
+  python zburn.py --config config.json up
 ) else (
   echo [提示] 没有 config.json，用内置默认配置启动
   python zburn.py up
