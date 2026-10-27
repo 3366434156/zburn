@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """面板前端（单个 HTML 字符串）。设计目标：手机上像原生 App，桌面上像后台。
 
-配色/间距刻意贴近常见管理后台：深底、卡片分层、状态用色点 + 药丸、操作放底部吸附条。
+配色/间距刻意贴近常见管理后台：深底、卡片分层、状态用色点 + 药丸、操作吸顶在头部。
 """
 
 PAGE = r"""<!DOCTYPE html><html lang="zh"><head>
@@ -18,14 +18,16 @@ PAGE = r"""<!DOCTYPE html><html lang="zh"><head>
   --r:14px; --sh:0 1px 0 rgba(255,255,255,.03),0 8px 24px rgba(0,0,0,.35);
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{max-width:100%;overflow-x:hidden}
+/* 用 clip 而不是 hidden：hidden 会让 body 变成滚动容器，header 的 position:sticky 就失效了 */
+html,body{max-width:100%;overflow-x:clip}
 body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#16202c 0%,var(--bg) 45%,var(--bg2) 100%);
   color:var(--fg);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
-  padding:0 0 calc(84px + env(safe-area-inset-bottom))}
+  padding:0 0 calc(24px + env(safe-area-inset-bottom))}
 
 /* ---------- 顶栏 ---------- */
 header{position:sticky;top:0;z-index:20;backdrop-filter:blur(14px);
-  background:rgba(13,17,23,.82);border-bottom:1px solid var(--line);
+  background:rgba(13,17,23,.94);border-bottom:1px solid var(--line);
+  box-shadow:0 8px 20px rgba(0,0,0,.28);
   padding:14px 16px calc(12px + env(safe-area-inset-top))}
 .hrow{display:flex;align-items:center;gap:10px;min-width:0}
 .hrow h1,.hrow .sub{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -109,6 +111,35 @@ summary::-webkit-details-marker{display:none}
 summary:before{content:"▸";color:var(--dim);transition:transform .18s}
 details[open] summary:before{transform:rotate(90deg)}
 
+/* ---------- 会话监控 ---------- */
+.sesslist{max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:10px;
+  background:#0d1219;padding:6px 10px;margin-top:10px}
+.sesslist label{display:flex;align-items:center;gap:9px;margin:2px 0;padding:5px 7px;border-radius:8px;
+  font-size:13.5px;color:var(--fg);cursor:pointer;overflow-wrap:anywhere;word-break:normal}
+.sesslist label:hover{background:rgba(255,255,255,.03)}
+.sesslist label.mon{background:rgba(63,185,80,.06)}
+.sesslist label.cur{background:rgba(47,129,247,.10);box-shadow:inset 2px 0 0 var(--acc)}
+.sesslist input[type=checkbox]{width:16px;height:16px;flex:0 0 auto;accent-color:#2f81f7}
+.sesslist .none{color:var(--dim2);font-size:12.5px}
+.sessproj{display:flex;align-items:center;gap:7px;margin:9px 2px 3px;font-size:11.5px;font-weight:700;
+  color:var(--acc2);letter-spacing:.02em}
+.sessproj:before{content:"";width:6px;height:6px;border-radius:2px;background:var(--acc);flex:0 0 auto}
+.sessproj span{color:var(--dim2);font-weight:500}
+.badge{margin-left:auto;flex:0 0 auto;font-size:10.5px;font-weight:700;letter-spacing:.02em;
+  padding:2px 7px;border-radius:999px;color:#7ee787;background:rgba(63,185,80,.12);
+  border:1px solid rgba(63,185,80,.35)}
+.badge.cur{margin-left:auto;color:#79c0ff;background:rgba(47,129,247,.14);border-color:rgba(47,129,247,.45)}
+.badge.cur + .badge{margin-left:6px}
+.monlist{display:grid;gap:6px;margin-top:10px}
+.monrow{display:flex;align-items:center;gap:8px;background:#0f141b;border:1px solid var(--line);
+  border-radius:9px;padding:8px 10px;font-size:13px}
+.monrow .monname{min-width:0;overflow-wrap:anywhere}
+.monrow .xbtn{margin-left:auto;flex:0 0 auto;appearance:none;cursor:pointer;
+  width:26px;height:26px;border-radius:8px;border:1px solid var(--line);background:transparent;
+  color:var(--dim);font-size:13px;line-height:1;display:grid;place-items:center}
+.monrow .xbtn:hover{color:#ff9a94;border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.08)}
+.monempty{color:var(--dim2);font-size:12.5px;padding:6px 2px}
+
 /* ---------- 日志 ---------- */
 .logbox{background:#0a0e13;border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .logbox .bar{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);
@@ -117,16 +148,14 @@ details[open] summary:before{transform:rotate(90deg)}
 pre#log{margin:0;padding:12px;max-height:42vh;overflow:auto;font:11.5px/1.6 ui-monospace,Consolas,monospace;
   white-space:pre-wrap;word-break:break-all;color:#9fb3c8}
 
-/* ---------- 底部吸附操作条 ---------- */
-.dock{position:fixed;left:0;right:0;bottom:0;z-index:30;padding:10px 16px calc(10px + env(safe-area-inset-bottom));
-  background:linear-gradient(180deg,rgba(13,17,23,.6),rgba(13,17,23,.96));backdrop-filter:blur(14px);
-  border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
-.dock .btn{min-height:44px;padding:0 6px;font-size:13px;min-width:0;white-space:nowrap}
-.dock .btn span.ico{font-size:15px}
-@media(max-width:380px){.dock .btn span.ico{display:none}}
+/* ---------- 顶部操作条（跟 header 一起吸顶，不用滚到底部找按钮） ---------- */
+.acts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}
+.acts .btn{min-height:40px;padding:0 6px;font-size:13px;min-width:0;white-space:nowrap}
+.acts .btn span.ico{font-size:15px}
+@media(max-width:380px){.acts .btn span.ico{display:none}}
 
 /* ---------- 提示 ---------- */
-.toast{position:fixed;left:50%;bottom:calc(92px + env(safe-area-inset-bottom));transform:translate(-50%,8px);
+.toast{position:fixed;left:50%;bottom:calc(24px + env(safe-area-inset-bottom));transform:translate(-50%,8px);
   background:#1f6feb;color:#fff;padding:10px 16px;border-radius:999px;font-size:13px;font-weight:600;
   opacity:0;transition:.18s;pointer-events:none;box-shadow:0 8px 24px rgba(31,111,235,.45);max-width:88vw;text-align:center}
 .toast.show{opacity:1;transform:translate(-50%,0)}
@@ -167,8 +196,6 @@ input:hover,textarea:hover{border-color:#2c3a4d}
   body{padding-bottom:24px}
   .wrap{grid-template-columns:1fr 1fr}
   .wrap .span2{grid-column:1/-1}
-  .dock{position:sticky;bottom:16px;margin:16px;border-radius:var(--r);border:1px solid var(--line);
-    grid-template-columns:repeat(4,minmax(0,1fr));background:rgba(22,27,34,.95)}
   .hero{margin:16px 16px 0}
 }
 </style></head><body>
@@ -192,6 +219,12 @@ input:hover,textarea:hover{border-color:#2c3a4d}
       c0-4.42-3.58-8-8-8z"/></svg>
     </a>
 
+  </div>
+  <div class="acts">
+    <button class="btn primary" onclick="act('start')"><span class="ico">▶</span>启动</button>
+    <button class="btn danger" onclick="act('stop')"><span class="ico">■</span>停止</button>
+    <button class="btn" onclick="act('feed')"><span class="ico">↻</span>投喂</button>
+    <button class="btn ghost" onclick="act('gateway')"><span class="ico">⚑</span>网关</button>
   </div>
 </header>
 
@@ -222,6 +255,7 @@ input:hover,textarea:hover{border-color:#2c3a4d}
     <h2>运行 <span id="pidLine"></span></h2>
     <div class="rows">
       <div class="row"><span class="k">守护进程</span><span class="v" id="vRun">—</span></div>
+      <div class="row"><span class="k">监控对话</span><span class="v" id="vMon">—</span></div>
       <div class="row"><span class="k">会话正则</span><span class="v" id="vRegex">—</span></div>
       <div class="row"><span class="k">巡检间隔</span><span class="v" id="vInterval">—</span></div>
       <div class="row"><span class="k">并发上限</span><span class="v" id="vMax">—</span></div>
@@ -243,7 +277,7 @@ input:hover,textarea:hover{border-color:#2c3a4d}
   <div class="card span2">
     <h2>参数 <span>改完下一轮生效</span></h2>
     <div style="display:grid;gap:0 14px;grid-template-columns:minmax(0,1fr)">
-      <div><label>会话名正则（只喂匹配的会话）</label><input id="cfgSession" placeholder="Supervisor:|项目名"></div>
+      <div><label>会话名正则（可选：监控名单之外还想按正则多喂几个时用）</label><input id="cfgSession" placeholder="留空即只喂监控名单"></div>
       <div class="g3">
         <div><label>间隔(秒)</label><input id="cfgInterval" type="number" min="20" step="10"></div>
         <div><label>并发上限</label><input id="cfgMax" type="number" min="1" max="12"></div>
@@ -256,15 +290,32 @@ input:hover,textarea:hover{border-color:#2c3a4d}
   </div>
 
   <div class="card span2">
+    <h2>会话监控 <span>只对名单里的对话续派；名单为空且正则为空就不投喂</span></h2>
+    <div class="btnrow" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+      <button class="btn sm ghost" onclick="scanSessions()">扫描侧栏对话</button>
+      <button class="btn sm" onclick="saveTargets()">保存勾选</button>
+    </div>
+    <label style="margin-top:14px">监控中的对话 <span id="monCount"></span></label>
+    <div id="monList" class="monlist"></div>
+    <div id="sessList" class="sesslist"><div class="none">点「扫描侧栏对话」列出 ZCode 侧栏里的会话，勾选要监控的，再点「保存勾选」。</div></div>
+    <div class="hint" id="sessWarn"></div>
+    <div class="hint" id="sessHint"></div>
+  </div>
+
+  <div class="card span2">
     <h2>高级配置 <span>写进 config.json，改前自动留 .bak</span></h2>
     <div class="rows">
       <div class="row"><span class="k">配置文件</span><span class="v" id="vCfgPath">—</span></div>
-      <div class="row"><span class="k">面板地址</span><span class="v" id="vPanelUrl">—</span></div>
+      <div class="row"><span class="k">面板地址</span><span class="v" id="vPanelUrl">—</span>
+        <button class="btn sm ghost" id="btnCopyUrl" style="margin-top:9px;display:none"
+                onclick="copyPhoneUrl()" title="复制带 token 的完整局域网地址，发到手机（微信/QQ 传给自己）直接打开">📋 复制给手机</button>
+      </div>
     </div>
     <details>
       <summary>展开：应用 / 网关 / 额度接口</summary>
       <label>应用进程名</label><input id="cfgProc" placeholder="ZCode">
       <label>应用 exe 路径</label><input id="cfgExe" placeholder="E:\exe\Zcode\ZCode.exe">
+      <label>窗口标题正则（同一客户端开了多个窗口时选哪个；留空 = 第一个主窗口）</label><input id="cfgWinTitle" placeholder="比如 zburn|我的项目">
       <label>网关健康检查地址</label><input id="cfgHealth" placeholder="http://127.0.0.1:3000/meta">
       <label>网关启动命令（网关挂了自动拉起）</label><input id="cfgStart" placeholder="python cli.py serve --port 3000">
       <label>网关工作目录</label><input id="cfgWorkdir" placeholder="E:\数据\AI\zcode2api">
@@ -292,13 +343,6 @@ input:hover,textarea:hover{border-color:#2c3a4d}
 
 </div>
 
-<div class="dock">
-  <button class="btn primary" onclick="act('start')"><span class="ico">▶</span>启动</button>
-  <button class="btn danger" onclick="act('stop')"><span class="ico">■</span>停止</button>
-  <button class="btn" onclick="act('feed')"><span class="ico">↻</span>投喂</button>
-  <button class="btn ghost" onclick="act('gateway')"><span class="ico">⚑</span>网关</button>
-</div>
-
 <div class="toast" id="toast"></div>
 <script>
 const TOKEN = new URLSearchParams(location.search).get('token') || '';
@@ -322,19 +366,179 @@ async function api(path, opt={}){
 }
 
 async function act(a){
+  // 停止要立刻给反馈：接口要等守护真的结束才返回，别让按钮看起来没反应
+  if(a === 'stop'){
+    setPill(document.getElementById('runPill'),'wait','停止中');
+    toast('正在停止…');
+  }
   try{
     const r = await api('/api/'+a, {method:'POST', body:'{}'});
-    toast(r.msg || '已完成'); setTimeout(load, 700);
+    toast(r.msg || '已完成'); setTimeout(load, a==='stop'?300:700);
   }catch(e){ toast('失败：'+e.message, true); }
+  if(a === 'stop') setTimeout(load, 1600);
 }
 async function savePrompt(){
   try{ await api('/api/prompt', {method:'POST', body: JSON.stringify({text: document.getElementById('prompt').value})});
        toast('指令已保存'); }catch(e){ toast('保存失败：'+e.message, true); }
 }
+
+let lastPanelUrl = '';
+
+async function copyText(t){
+  // 手机/局域网走的是 http，不算安全上下文，navigator.clipboard 可能没有——退化到 execCommand
+  try{ await navigator.clipboard.writeText(t); return true; }catch(e){}
+  const ta = document.createElement('textarea');
+  ta.value = t; ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+  document.body.appendChild(ta); ta.focus(); ta.select();
+  try{ return document.execCommand('copy'); } finally { ta.remove(); }
+}
+
+async function copyPhoneUrl(){
+  if(!lastPanelUrl){
+    toast('面板只监听了本机：把高级配置里的「面板监听地址」改成 0.0.0.0 保存后重启面板', true);
+    return;
+  }
+  const ok = await copyText(lastPanelUrl);
+  toast(ok ? '已复制手机地址（完整地址在「高级配置 → 面板地址」）'
+           : '自动复制失败，请手动长按复制', !ok);
+}
+const esc = s => (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let scanned = [];      // 最近一次扫描到的侧栏对话
+let monitored = [];    // 监控名单（config.feed.targets 的本地副本）
+let lastTargetSig = null;
+
+// 名单里的标识：唯一对话就是标题，同名对话是「标题#序号」
+function dispId(id){
+  const m = /^(.*)#(\d+)$/.exec(id || '');
+  return m ? `${m[1]}（同名第 ${m[2]} 个）` : (id || '');
+}
+
+function renderMonitored(){
+  document.getElementById('monCount').textContent = monitored.length ? `（${monitored.length} 个）` : '';
+  const box = document.getElementById('monList');
+  if(!monitored.length){
+    box.innerHTML = '<div class="monempty">还没监控任何对话。扫描侧栏 → 勾选 → 保存勾选。</div>';
+  }else{
+    box.innerHTML = monitored.map((id,i)=>
+      `<div class="monrow"><span class="monname">${esc(projPrefix(id) + dispId(id))}</span>` +
+      `<button class="xbtn" data-i="${i}" title="取消监控">✕</button></div>`).join('');
+    box.querySelectorAll('.xbtn').forEach(b => { b.onclick = () => removeTarget(+b.dataset.i); });
+  }
+  refreshBadges();
+}
+
+// 最近一次扫描里这个会话属于哪个项目（没扫描过就只显示标题）
+function projPrefix(id){
+  const s = scanned.find(x => x.id === id);
+  return s && s.project ? s.project + ' · ' : '';
+}
+
+function refreshBadges(){
+  const set = new Set(monitored);
+  document.querySelectorAll('#sessList label[data-id]').forEach(l=>{
+    const on = set.has(l.dataset.id);
+    l.classList.toggle('mon', on);
+    const cb = l.querySelector('input[type=checkbox]');
+    if(cb) cb.checked = on;
+    let b = l.querySelector('.badge.mon');
+    if(on && !b){ b = document.createElement('span'); b.className = 'badge mon'; b.textContent = '监控中'; l.appendChild(b); }
+    if(!on && b) b.remove();
+  });
+}
+
+async function postTargets(list){
+  const next = [...new Set(list)];
+  try{
+    await api('/api/config', {method:'POST', body: JSON.stringify({targets: next})});
+    // 签名格式必须跟 load() 里一致，否则名单会每 3 秒被重绘一次（点击正好撞上就丢）
+    monitored = next; lastTargetSig = JSON.stringify(next); renderMonitored();
+    toast(next.length ? `已监控 ${next.length} 个对话` : '已清空监控名单，现在不会投喂');
+    setTimeout(load, 700);
+  }catch(e){ toast('保存失败：'+e.message, true); }
+}
+
+function removeTarget(i){ postTargets(monitored.filter((_,k)=>k!==i)); }
+
+async function scanSessions(){
+  const box = document.getElementById('sessList');
+  box.innerHTML = '<div class="none">扫描中…（读 ZCode 无障碍树，几秒钟）</div>';
+  try{
+    const r = await api('/api/sessions');
+    scanned = r.sessions || [];
+    if(!scanned.length){
+      box.innerHTML = '<div class="none">侧栏没列出对话：ZCode 没开，或无障碍树被关了（试 python zburn.py restart-app）。</div>';
+      return;
+    }
+    const cur = new Set(monitored);
+    // 按项目分组（保持侧栏顺序），当前打开的对话标「当前」——扫描前很难分清同名/跨项目会话
+    const groups = [];
+    const gmap = new Map();
+    scanned.forEach((s, i)=>{
+      const p = s.project || '未分组';
+      if(!gmap.has(p)){ gmap.set(p, []); groups.push([p, gmap.get(p)]); }
+      gmap.get(p).push(i);
+    });
+    box.innerHTML = groups.map(([p, idxs]) =>
+      `<div class="sessproj">${esc(p)}<span>${idxs.length}</span></div>` +
+      idxs.map(i => {
+        const s = scanned[i], on = cur.has(s.id);
+        const dup = s.count > 1 ? ` <span style="color:#6b7480">#${s.ord}</span>` : '';
+        const badges = (s.active?'<span class="badge cur" title="扫描时 ZCode 正打开的就是这个对话">当前</span>':'') +
+                       (on?'<span class="badge mon">监控中</span>':'');
+        return `<label data-id="${esc(s.id)}" class="${on?'mon':''}${s.active?' cur':''}">` +
+          `<input type="checkbox" data-i="${i}" ${on?'checked':''}>` +
+          `<span>${esc(s.key)}${dup}</span>` + badges + `</label>`;
+      }).join('')
+    ).join('');
+    box.querySelectorAll('input[type=checkbox]').forEach(cb=>{
+      cb.onchange = () => refreshBadgesFromCheck();
+    });
+    // 当前对话可能在滚动区外面，扫描完把它连同所属项目头一起带到眼前
+    const curRow = box.querySelector('label.cur');
+    if(curRow){
+      let head = curRow.previousElementSibling;
+      while(head && !head.classList.contains('sessproj')) head = head.previousElementSibling;
+      const anchor = head || curRow;
+      box.scrollTop = Math.max(0, anchor.offsetTop - box.offsetTop - 8);
+    }
+    renderMonitored();   // 监控名单补上「项目 · 标题」
+    // 名单里有、但这次侧栏没扫到的：可能改了名/被删了，直接说出来
+    const missing = monitored.filter(id => !scanned.some(s => s.id === id));
+    const warn = document.getElementById('sessWarn');
+    warn.style.color = '#e3b341';
+    warn.textContent = missing.length
+      ? `名单里这 ${missing.length} 个在侧栏没找到（改名/删除？）：` + missing.map(dispId).join('、')
+      : '';
+    toast(`扫描到 ${scanned.length} 个对话 / ${groups.length} 个项目（「当前」= 扫描时正打开的对话），勾选后点「保存勾选」`);
+  }catch(e){ box.innerHTML = '<div class="none">扫描失败：'+esc(e.message)+'</div>'; }
+}
+
+// 勾选状态变了就同步角标（不重新渲染，避免打断勾选）
+function refreshBadgesFromCheck(){
+  document.querySelectorAll('#sessList label[data-id]').forEach(l=>{
+    const cb = l.querySelector('input[type=checkbox]');
+    const on = !!(cb && cb.checked);
+    l.classList.toggle('mon', on);
+    let b = l.querySelector('.badge.mon');
+    if(on && !b){ b = document.createElement('span'); b.className='badge mon'; b.textContent='监控中'; l.appendChild(b); }
+    if(!on && b){ b.remove(); }
+  });
+}
+
+async function saveTargets(){
+  const checked = [...document.querySelectorAll('#sessList input[type=checkbox]:checked')]
+    .map(c => scanned[+c.dataset.i].id).filter(Boolean);
+  const seen = new Set(scanned.map(s=>s.id));
+  // 这次侧栏没列出来的（被归档/滚动没渲染/应用没开）不能因为保存就丢掉
+  const keep = monitored.filter(id => !seen.has(id));
+  await postTargets([...keep, ...checked]);
+}
+
 async function saveCfg(){
   const val = id => document.getElementById(id).value.trim();
   const body = {
     session_regex: val('cfgSession'),
+    window_title_regex: val('cfgWinTitle'),
     interval_seconds: +val('cfgInterval'),
     max_sessions: +val('cfgMax'),
     stop_below: +val('cfgStop'),
@@ -349,7 +553,11 @@ async function saveCfg(){
     panel_host: val('cfgHost'),
     panel_port: +val('cfgPort')
   };
-  Object.keys(body).forEach(k => { if(body[k]==='' || Number.isNaN(body[k])) delete body[k]; });
+  // 会话正则/窗口正则允许清空（清空=只喂勾选的会话），其余空值照旧跳过
+  const clearable = ['session_regex', 'window_title_regex'];
+  Object.keys(body).forEach(k => {
+    if((body[k]==='' || Number.isNaN(body[k])) && !clearable.includes(k)) delete body[k];
+  });
   try{
     const r = await api('/api/config', {method:'POST', body: JSON.stringify(body)});
     toast(r.msg || '参数已保存'); setTimeout(load, 700);
@@ -388,7 +596,7 @@ async function load(){
   document.getElementById('quota').textContent = fmt(s.remaining);
   document.getElementById('stopAt').textContent = fmt(s.config.stop_below);
   document.getElementById('cycle').textContent = s.status?.cycle ?? '—';
-  document.getElementById('hb').textContent = s.heartbeat_age===null ? '—' : (s.heartbeat_age+'s');
+  document.getElementById('hb').textContent = (!running || s.heartbeat_age===null) ? '—' : (s.heartbeat_age+'s');
 
   setDot('dApp', s.app_running?'ok':'bad');   document.getElementById('vApp').textContent = s.app_running?'在运行':'未运行';
   setDot('dLock', s.locked?'warn':'');        document.getElementById('vLock').textContent = s.locked?'锁屏':'解锁';
@@ -402,6 +610,24 @@ async function load(){
   document.getElementById('vInterval').textContent = s.config.interval_seconds + ' 秒';
   document.getElementById('vMax').textContent = s.config.max_sessions + ' 个';
 
+  // 监控名单以服务端为准；只有真的变了才重绘，避免 3 秒轮询把勾选打断
+  const tg = s.config.targets || [];
+  const sig = JSON.stringify(tg);
+  if(sig !== lastTargetSig){
+    lastTargetSig = sig;
+    monitored = tg.slice();
+    renderMonitored();
+  }
+  document.getElementById('vMon').textContent = tg.length ? tg.length + ' 个' : '未指定';
+  document.getElementById('sessHint').textContent = tg.length
+    ? '只对上面这些对话续派；侧栏里改过名的对话需要重新扫描勾选。'
+    : ('当前没有监控任何对话' + (s.config.session_regex ? '（按正则喂）' : '（不会投喂）'));
+
+  // 手机地址：服务端按实际绑定地址算（绑了 0.0.0.0 且有 token 才给）
+  lastPanelUrl = s.panel_url || '';
+  document.getElementById('vPanelUrl').textContent = lastPanelUrl || (location.origin + '/?token=…');
+  document.getElementById('btnCopyUrl').style.display = lastPanelUrl ? '' : 'none';
+
   const log = document.getElementById('log');
   log.textContent = (s.logs||[]).join('\n') || '（还没有日志）';
   log.scrollTop = log.scrollHeight;
@@ -410,6 +636,7 @@ async function load(){
   if(first){
     const set = (id, v) => { const el = document.getElementById(id); if(el) el.value = (v===null||v===undefined)?'':v; };
     set('cfgSession', s.config.session_regex);
+    set('cfgWinTitle', s.config.window_title_regex);
     set('cfgInterval', s.config.interval_seconds);
     set('cfgMax', s.config.max_sessions);
     set('cfgStop', s.config.stop_below);
@@ -424,7 +651,6 @@ async function load(){
     set('cfgHost', s.config.panel_host);
     set('cfgPort', s.config.panel_port);
     document.getElementById('vCfgPath').textContent = s.config.config_path || '—';
-    document.getElementById('vPanelUrl').textContent = location.origin + '/?token=…';
     api('/api/prompt').then(t=>{ document.getElementById('prompt').value = t; }).catch(()=>{});
     first = false;
   }

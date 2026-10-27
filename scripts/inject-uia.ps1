@@ -23,6 +23,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$Text,
     [string]$ProcessName = 'ZCode',
+    # 同一个客户端开了多个窗口时，用窗口标题挑一个；留空 = 第一个有主窗口的进程
+    [string]$WindowTitleRegex = '',
     [string]$SendButtonRegex = '发送|加入队列|立即|Send',
     # 「移除待发送消息」「停止生成」里也含"发送/生成"，必须排除，否则会点错按钮
     [string]$ExcludeButtonRegex = '移除待发送消息|停止生成|Remove queued|Stop generating',
@@ -37,16 +39,55 @@ Add-Type -AssemblyName UIAutomationTypes
 Add-Type -Namespace Zburn -Name Native -MemberDefinition @"
 [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
 "@
+Add-Type -Namespace Zburn -Name Win -MemberDefinition @"
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
+public delegate bool EnumProc(IntPtr h, IntPtr lp);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int max);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+"@
 
 $WM_CHAR = 0x0102
 $AT = [System.Windows.Automation.AutomationElement]
 $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
 
 # ---------------------------------------------------------------- 找窗口
-$proc = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
-    Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
-if (-not $proc) { [Console]::Error.WriteLine("未找到 $ProcessName 主窗口（进程在跑但没窗口？）"); exit 1 }
-$top = $proc.MainWindowHandle
+function Find-TargetWindow {
+    param([string]$ProcName, [string]$TitleRegex)
+    if ($TitleRegex) {
+        $procIds = @(Get-Process -Name $ProcName -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
+        if ($procIds.Count -eq 0) { return $null }
+        $wins = New-Object System.Collections.ArrayList
+        $cb = [Zburn.Win+EnumProc] {
+            param($h, $lp)
+            try {
+                if (-not [Zburn.Win]::IsWindowVisible($h)) { return $true }
+                [uint32]$wpid = 0
+                [void][Zburn.Win]::GetWindowThreadProcessId($h, [ref]$wpid)
+                if ($procIds -contains [int]$wpid) {
+                    $sb = New-Object System.Text.StringBuilder 512
+                    [void][Zburn.Win]::GetWindowText($h, $sb, 512)
+                    if ($sb.Length -gt 0) { [void]$wins.Add([pscustomobject]@{ H = $h; Title = $sb.ToString() }) }
+                }
+            } catch { }
+            return $true
+        }
+        [void][Zburn.Win]::EnumWindows($cb, [IntPtr]::Zero)
+        return @($wins | Where-Object { $_.Title -match $TitleRegex } | Select-Object -First 1)
+    }
+    $proc = Get-Process -Name $ProcName -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+    if (-not $proc) { return $null }
+    return [pscustomobject]@{ H = $proc.MainWindowHandle; Title = $proc.MainWindowTitle }
+}
+
+$win = Find-TargetWindow -ProcName $ProcessName -TitleRegex $WindowTitleRegex
+if (-not $win) {
+    if ($WindowTitleRegex) { [Console]::Error.WriteLine("没有标题匹配 /$WindowTitleRegex/ 的 $ProcessName 窗口") }
+    else { [Console]::Error.WriteLine("未找到 $ProcessName 主窗口（进程在跑但没窗口？）") }
+    exit 1
+}
+$top = $win.H
 $root = $AT::FromHandle($top)
 
 # ---------------------------------------------------------------- 枚举控件

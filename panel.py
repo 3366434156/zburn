@@ -40,15 +40,39 @@ class Supervisor:
         except Exception:
             return None
 
+    @staticmethod
+    def _pid_image(pid: int) -> str:
+        """进程的可执行文件路径；进程不存在/打不开返回空串。"""
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.c_ulong(1024)
+            if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return ""
+            return buf.value
+        finally:
+            k32.CloseHandle(h)
+
     def alive(self) -> bool:
+        """守护是否真的活着。
+
+        光看 PID 会误判：pid 文件放久了 PID 会被系统复用（实测复用成了 ZCode 的 node，
+        于是面板显示"运行中"，点停止还会把应用杀掉）。所以还要核对可执行文件是不是 Python。
+        """
         pid = self.pid()
         if not pid:
             return False
         if os.name == "nt":
-            r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                               capture_output=True, text=True, errors="replace",
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            return str(pid) in (r.stdout or "")
+            exe = self._pid_image(pid)
+            if not exe:
+                return False
+            name = pathlib.Path(exe).name.lower()
+            return name.startswith("python") or exe.lower() == sys.executable.lower()
         try:
             os.kill(pid, 0)
             return True
@@ -59,9 +83,11 @@ class Supervisor:
         if self.alive():
             return False, "已在运行"
         self.stop_file.unlink(missing_ok=True)
-        args = [sys.executable, str(pathlib.Path(__file__).resolve().parent / "zburn.py"), "run"]
+        # --config 必须写在子命令前面，否则 argparse 会报 unrecognized arguments
+        args = [sys.executable, str(pathlib.Path(__file__).resolve().parent / "zburn.py")]
         if self.config_path:
             args += ["--config", self.config_path]
+        args.append("run")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         out = open(self.dir / "supervisor.out", "a", encoding="utf-8")
         startup = 0
@@ -74,22 +100,56 @@ class Supervisor:
         self.pid_file.write_text(str(p.pid))
         return True, f"已启动 pid={p.pid}"
 
+    def _kill_stray_daemons(self) -> int:
+        """兜底：pid 文件对不上/缺失时，按命令行找「python … zburn.py … run」的守护进程，
+        连同它的子进程（正在投喂的 pwsh）一起杀。匹配很收紧，不会碰到 panel/watchdog。"""
+        if os.name != "nt":
+            return 0
+        import zburn
+        ps = ("$pids = Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | "
+              "Where-Object { $_.CommandLine -match 'zburn\\.py' -and $_.CommandLine -match '\\srun(\\s|$)' "
+              "-and $_.CommandLine -notmatch 'panel|watchdog|doctor|inject|feed' } | "
+              "Select-Object -ExpandProperty ProcessId; "
+              "foreach ($p in $pids) { taskkill /PID $p /T /F 2>$null | Out-Null }; "
+              "@($pids) -join ','")
+        r = subprocess.run([zburn.pwsh(), "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, errors="replace",
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (r.stdout or "").strip()
+        return len([p for p in out.split(",") if p.strip().isdigit()])
+
     def stop(self) -> tuple[bool, str]:
         self.stop_file.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
         pid = self.pid()
+        killed = 0
+        if pid and not self.alive():
+            # pid 文件过期（PID 已被系统复用给别的程序）：先扔掉，别留着吓人
+            self.pid_file.unlink(missing_ok=True)
         if pid and self.alive():
-            time.sleep(1.5)
+            # 先给守护一点点时间自己看 STOP 收工（正常路径，最干净），来不及就强杀
+            for _ in range(6):
+                time.sleep(0.15)
+                if not self.alive():
+                    break
             if self.alive():
                 if os.name == "nt":
-                    subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True,
+                    # /T 很关键：把守护正在跑的投喂脚本（pwsh）一起结束，
+                    # 否则它成了孤儿进程，会继续把指令逐字打完（几分钟），感觉"关了还在打字"
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    killed += 1
                 else:
                     try:
                         os.kill(pid, 9)
+                        killed += 1
                     except OSError:
                         pass
-                return True, "已停止（STOP 文件 + 强制结束）"
-        return True, "已请求停止"
+        if not killed:
+            # pid 对不上（被看门狗重启过 / pid 文件丢了）才去按命令行兜底找
+            killed += self._kill_stray_daemons()
+        if killed:
+            return True, "已停止（守护与投喂子进程一起结束）"
+        return True, "已请求停止（STOP 文件已放好）"
 
 
 # ------------------------------------------------------------------ 配置字段
@@ -98,6 +158,7 @@ CONFIG_FIELDS: dict[str, tuple[tuple[str, str], type]] = {
     "process_name": (("app", "process_name"), str),
     "app_exe": (("app", "exe"), str),
     "session_regex": (("uia", "session_regex"), str),
+    "window_title_regex": (("uia", "window_title_regex"), str),
     "send_button_regex": (("uia", "send_button_regex"), str),
     "interval_seconds": (("feed", "interval_seconds"), int),
     "max_sessions": (("feed", "max_sessions"), int),
@@ -117,6 +178,13 @@ def apply_config_body(cur: dict, body: dict) -> tuple[dict, list[str]]:
     import re
     notes: list[str] = []
     for flat, value in body.items():
+        if flat == "targets":       # 监控名单：面板「会话监控」勾选的对话标识
+            if isinstance(value, list):
+                cur.setdefault("feed", {})["targets"] = [
+                    str(v).strip() for v in value if str(v).strip()]
+            else:
+                notes.append("targets 要是字符串数组，已忽略")
+            continue
         spec = CONFIG_FIELDS.get(flat)
         if not spec:
             continue
@@ -143,8 +211,27 @@ def apply_config_body(cur: dict, body: dict) -> tuple[dict, list[str]]:
 
 
 # ------------------------------------------------------------------ 状态汇总
+# 环境探测有代价（要起 PowerShell），而面板每 3 秒轮询一次——缓存几秒，
+# 既不让页面变卡，也不会把 CPU 烧在一次次的进程枚举上。
+_PROBE_TTL = 4.0
+_probe_cache: dict[str, tuple[float, object]] = {}
+
+
+def _cached(key: str, fn, ttl: float = _PROBE_TTL):
+    hit = _probe_cache.get(key)
+    now = time.time()
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    try:
+        val = fn()
+    except Exception:
+        val = None
+    _probe_cache[key] = (now, val)
+    return val
+
+
 def collect(cfg: dict, st, sup: Supervisor, tail: int = 120,
-            config_path: str | None = None) -> dict:
+            config_path: str | None = None, panel_url: str = "") -> dict:
     import zburn  # 延迟导入，避免循环
 
     status = {}
@@ -173,6 +260,9 @@ def collect(cfg: dict, st, sup: Supervisor, tail: int = 120,
     except Exception:
         pass
 
+    app_on = _cached("app_running", lambda: zburn.app_running(cfg)) if os.name == "nt" else False
+    locked = _cached("locked", zburn.desktop_locked) if os.name == "nt" else False
+
     logs = []
     if st.log_path.exists():
         try:
@@ -191,15 +281,20 @@ def collect(cfg: dict, st, sup: Supervisor, tail: int = 120,
         except OSError:
             pass
 
+    running = sup.alive()
     return {
         "version": VERSION,
-        "running": sup.alive(),
-        "pid": sup.pid(),
+        "running": running,
+        "panel_url": panel_url,
+        # pid 文件会过期（PID 被系统复用），守护没在跑就别把旧 pid 报给前端
+        "pid": sup.pid() if running else None,
         "heartbeat_age": hb_age,
-        "stop_pending": sup.stop_file.exists(),
+        # 只有守护还活着时才算「正在停」：STOP 文件会一直留在磁盘上，
+        # 光看文件存在会让面板永远显示「停止中」
+        "stop_pending": running and sup.stop_file.exists(),
         "status": status,
-        "app_running": zburn.app_running(cfg) if os.name == "nt" else False,
-        "locked": zburn.desktop_locked() if os.name == "nt" else False,
+        "app_running": bool(app_on),
+        "locked": bool(locked),
         "gateway_ok": gw,
         "remaining": remaining,
         "quota_history": hist,
@@ -208,6 +303,8 @@ def collect(cfg: dict, st, sup: Supervisor, tail: int = 120,
             "process_name": cfg["app"]["process_name"],
             "app_exe": cfg["app"].get("exe", ""),
             "session_regex": cfg["uia"]["session_regex"],
+            "window_title_regex": cfg["uia"].get("window_title_regex", ""),
+            "targets": cfg["feed"].get("targets", []),
             "send_button_regex": cfg["uia"].get("send_button_regex", ""),
             "max_sessions": cfg["feed"]["max_sessions"],
             "interval_seconds": cfg["feed"]["interval_seconds"],
@@ -231,7 +328,8 @@ from panel_ui import PAGE  # 前端单页（见 panel_ui.py）
 
 
 # ------------------------------------------------------------------ 服务
-def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token: str):
+def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token: str,
+                 host: str = "127.0.0.1", port: int = 0):
     import zburn
 
     class Handler(BaseHTTPRequestHandler):
@@ -239,6 +337,19 @@ def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token:
 
         def log_message(self, fmt, *args):  # 面板不刷访问日志
             pass
+
+        def _panel_url(self) -> str:
+            """手机同网段访问的完整地址（含 token）；只绑了本机或没 token 时给空串。
+
+            绑定的是具体地址就用它，绑 0.0.0.0/:: 才现查局域网 IP——面板
+            实际怎么监听决定给什么地址，配置里写什么不算数。
+            """
+            if not token or host in ("127.0.0.1", "localhost", "::1"):
+                return ""
+            ip = host if host not in ("0.0.0.0", "::") else zburn.lan_ip()
+            if not ip or ip in ("127.0.0.1", "::1"):
+                return ""
+            return f"http://{ip}:{port}/?token={token}"
 
         # ---------- 鉴权
         def _authorized(self) -> bool:
@@ -272,7 +383,39 @@ def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token:
             if not self._authorized():
                 return self._json(401, {"error": "unauthorized"})
             if u.path == "/api/state":
-                return self._json(200, collect(cfg, st, sup, config_path=config_path))
+                return self._json(200, collect(cfg, st, sup, config_path=config_path,
+                                               panel_url=self._panel_url()))
+            if u.path == "/api/sessions":
+                # 扫描应用侧栏的对话（只读，不输入），给「会话监控」卡片勾选用
+                params = {"ProcessName": cfg["app"]["process_name"],
+                          "WindowTitleRegex": cfg["uia"].get("window_title_regex", ""),
+                          "DryRun": True, "Json": True, "MaxDepth": cfg["uia"]["max_depth"]}
+                code, out, err = zburn.run_ps("feed-sessions.ps1", params, timeout=120)
+                sessions = []
+                try:
+                    # 只取 JSON 部分：ps1 可能还有别的输出行
+                    body = out[out.index("["):] if "[" in out else out
+                    data = json.loads(body)
+                    if isinstance(data, dict):
+                        data = [data]
+                    # id = 稳定的监控标识：唯一对话就是标题（去掉末尾相对时间），
+                    # 同名对话再加 #序号（侧栏里同名能有好几条，必须分得清）
+                    sessions = [{"name": d.get("name", ""),
+                                 "key": d.get("key") or d.get("name", ""),
+                                 "id": d.get("id") or d.get("key") or d.get("name", ""),
+                                 "ord": d.get("ord", 1),
+                                 "count": d.get("count", 1),
+                                 "project": d.get("project", ""),
+                                 "active": bool(d.get("active")),
+                                 "x": d.get("x", 0), "y": d.get("y", 0)}
+                                for d in data if isinstance(d, dict) and d.get("name")]
+                except Exception:
+                    return self._json(200, {"ok": False, "sessions": [],
+                                            "targets": cfg["feed"].get("targets", []),
+                                            "msg": (err or out).strip()[:160] or f"exit {code}"})
+                return self._json(200, {"ok": True, "sessions": sessions,
+                                        "targets": cfg["feed"].get("targets", []),
+                                        "msg": f"扫描到 {len(sessions)} 个会话"})
             if u.path == "/api/prompt":
                 p = pathlib.Path(cfg["prompt"].get("file") or "next-prompt.txt")
                 if not p.is_absolute():
@@ -382,7 +525,7 @@ def serve(cfg: dict, *, host: str, port: int, token: str, config_path: str | Non
     port = pick_port(host, port)
     st.log(f"[panel] 面板启动 http://{host}:{port}/  鉴权={'token' if token else '仅本机'}")
     sup = Supervisor(cfg, st.dir, config_path)
-    handler = make_handler(cfg, st, sup, config_path, token)
+    handler = make_handler(cfg, st, sup, config_path, token, host=host, port=port)
     try:
         srv = ThreadingHTTPServer((host, port), handler)
     except OSError as e:

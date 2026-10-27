@@ -10,7 +10,8 @@
     "send_button_regex": "发送|加入队列|立即|Send",
     "busy_regex": "停止生成|Stop generating",
     "queued_regex": "移除待发送消息|Remove queued",
-    "session_regex": ".",
+    "session_regex": "",
+    "window_title_regex": "",
     "max_depth": 40,
     "char_delay_ms": 20
   },
@@ -24,7 +25,8 @@
   },
   "feed": {
     "max_sessions": 5,
-    "interval_seconds": 120
+    "interval_seconds": 120,
+    "targets": []
   },
   "gateway": {
     "health_url": "http://127.0.0.1:3000/meta",
