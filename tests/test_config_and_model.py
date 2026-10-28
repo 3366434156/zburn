@@ -141,6 +141,25 @@ def test_handoff_rejects_non_ascii():
     assert agents._normalize_handoff({"action": "feed", "prompt": "继续"}) is None
 
 
+# ---------------------------------------------------------------- 账号明细
+def test_account_rows_flags_unknown_quota():
+    """没有 quota 字段的账号不能当成「已烧完」，得说「还没刷过」。"""
+    rows = zburn.account_rows([
+        {"name": "有数据", "enabled": True, "status": "exhausted", "use_count": 12,
+         "quota": {"GLM-5.3-Flash": {"total": 5, "used": 5, "remaining": 0}}},
+        {"name": "没数据", "enabled": True, "status": "active", "use_count": 3, "quota": {}},
+    ])
+    assert rows[0]["unknown"] is False
+    assert rows[0]["models"]["GLM-5.3-Flash"]["remaining"] == 0
+    assert rows[1]["unknown"] is True
+
+
+def test_fmt_int_tolerates_junk():
+    assert zburn._fmt_int(1234567) == "1,234,567"
+    assert zburn._fmt_int(None) == "?"
+    assert zburn._fmt_int("abc") == "?"
+
+
 # ---------------------------------------------------------------- 监控名单
 def test_set_dynamic_targets_replaces_and_clears(tmp_path):
     st = _fake_state(tmp_path)

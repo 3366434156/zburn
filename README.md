@@ -255,6 +255,7 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 |---|---|
 | `doctor` | 环境自检（应用/无障碍树/锁屏状态/网关/额度/模板） |
 | `quota [--refresh]` | 读一次额度 |
+| `accounts [--refresh] [--json]` | 按账号看额度明细：哪个号还剩、哪个烧完了、哪个还没刷过 |
 | `status [--follow]` | 看 status.json、心跳、最近日志 |
 | `probe [--filter] [--json]` | 导出目标窗口无障碍树（换应用第一件事） |
 | `inject --text "…" [--dry-run] [--no-enter]` | 直接往输入框投一条 |

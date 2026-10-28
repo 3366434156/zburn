@@ -1418,6 +1418,100 @@ def quota_rate(st: State, minutes: int = 60) -> dict:
             "samples": len(pts)}
 
 
+def read_accounts(cfg: dict) -> list[dict]:
+    """网关里每个账号的额度明细（按模型分）。读不到就返回空表。"""
+    q = cfg["quota"]
+    if q.get("provider") != "gateway_zcode2api":
+        return []
+    try:
+        data = http_json(q["url"], headers=quota_headers(q))
+    except Exception:
+        return []
+    return [a for a in (data.get("accounts") or []) if isinstance(a, dict)]
+
+
+def _fmt_int(v) -> str:
+    try:
+        return f"{int(v):,}"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def account_rows(accounts: list[dict]) -> list[dict]:
+    """把网关的账号结构压成表里一行（不同版本的字段名都兜一下）。"""
+    rows = []
+    for a in accounts:
+        quota = a.get("quota") or {}
+        models = {}
+        for model, ent in quota.items():
+            if not isinstance(ent, dict):
+                continue
+            models[model] = {
+                "total": ent.get("total"), "used": ent.get("used"),
+                "remaining": ent.get("remaining"),
+            }
+        rows.append({
+            "name": str(a.get("name") or a.get("id") or "?"),
+            "enabled": bool(a.get("enabled", True)),
+            "status": str(a.get("status") or ""),
+            "use_count": a.get("use_count"),
+            "fail_count": a.get("fail_count"),
+            "models": models,
+            "unknown": not models,          # 没刷过额度，不知道还剩多少
+            "cooling_until": a.get("cooling_until") or 0,
+            "last_error": str(a.get("last_error") or ""),
+        })
+    return rows
+
+
+def cmd_accounts(a) -> int:
+    """按账号看额度（总剩余看不出「哪个号还有钱」，这个能看）。"""
+    cfg = load_config(a.config)
+    if getattr(a, "refresh", False):
+        print("刷新额度:", "成功" if refresh_quota(cfg) else "失败")
+    accs = read_accounts(cfg)
+    if not accs:
+        print("读不到账号明细（quota.provider 必须是 gateway_zcode2api，且网关要活着）")
+        return 1
+    rows = account_rows(accs)
+    if getattr(a, "json", False):
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return 0
+    width = max([len(r["name"]) for r in rows] + [8])
+    print(f"{'账号'.ljust(width)}  {'状态':10} {'调用':>6}  各模型 剩余/总量")
+    total_left = 0
+    unknown = 0
+    for r in rows:
+        if not r["enabled"]:
+            state = "disabled"
+        elif r["cooling_until"] and float(r["cooling_until"]) > time.time():
+            state = "冷却中"
+        else:
+            state = r["status"] or "?"
+        if r["unknown"]:
+            unknown += 1
+            detail = "（还没刷过额度：zburn accounts --refresh）"
+        else:
+            parts = []
+            for model, m in sorted(r["models"].items()):
+                if m["remaining"] is not None:
+                    total_left += int(m["remaining"])
+                parts.append(f"{model} {_fmt_int(m['remaining'])}/{_fmt_int(m['total'])}")
+            detail = "   ".join(parts) or "（空）"
+        print(f"{r['name'].ljust(width)}  {state:10} {_fmt_int(r['use_count']):>6}  {detail}")
+        if r["last_error"]:
+            print(f"{' ' * width}  └ {r['last_error'][:90]}")
+    print(f"\n合计剩余: {_fmt_int(total_left)}")
+    if unknown:
+        print(f"有 {unknown} 个账号没有额度信息（quota 字段是空的）："
+              "用 `zburn accounts --refresh` 让网关去查一次")
+    dead = [r["name"] for r in rows if r["enabled"] and not r["unknown"]
+            and all((m["remaining"] or 0) <= 0 for m in r["models"].values())]
+    if dead:
+        print("已烧完：" + "、".join(dead))
+    return 0
+
+
 def cmd_status(a) -> int:
     cfg = load_config(a.config)
     st = State(cfg)
@@ -2169,6 +2263,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("quota", help="读一次额度")
     p.add_argument("--refresh", action="store_true", help="先请求后端刷新")
     p.set_defaults(func=cmd_quota)
+
+    p = sub.add_parser("accounts", help="按账号看额度明细（哪个号还有钱）")
+    p.add_argument("--refresh", action="store_true", help="先请求后端刷新")
+    p.add_argument("--json", action="store_true", help="输出 JSON")
+    p.set_defaults(func=cmd_accounts)
 
     p = sub.add_parser("status", help="看状态与日志")
     p.add_argument("--follow", action="store_true")
