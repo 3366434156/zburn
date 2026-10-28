@@ -136,6 +136,62 @@ function Find-Composer($items) {
     return $best
 }
 
+# 会话是否真的切过去了。ZCode 的当前对话是 ListItem 上的 bg-selected class，
+# 没有 SelectionItemPattern；DSH 的 TreeItem 才用 SelectionItem。
+function Test-SessionSelected($item) {
+    try {
+        $p = $null
+        if ($item.El.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) {
+            return [bool]$p.Current.IsSelected
+        }
+    } catch { }
+    if ($item.Type -eq 'ControlType.ListItem') {
+        try { return ($item.El.Current.ClassName -match 'bg-selected') } catch { return $false }
+    }
+    return $true          # TreeItem 没有 bg-selected 约定：Pattern 不抛就算成功
+}
+
+function Wait-SessionSelected($item, [int]$TimeoutMs = 1600) {
+    $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
+    do {
+        if (Test-SessionSelected $item) { return $true }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::Now -lt $deadline)
+    return $false
+}
+
+# 切换会话：已经选中的直接算成功；否则 SelectionItem（DSH）→ Invoke（ZCode 的
+# ListItem 只支持这个）→ 重扫一次再试。侧栏每分钟刷新相对时间（"3分"→"4分"），
+# UIA 节点可能在那一下被重建：手里的 El 会变成「元素不可用」，两个 Pattern 都抛。
+# 重扫后按 Key+Y 找同一条再点。切完必须确认真的选中了 —— Invoke 不抛不代表切成功，
+# 没切过去就投喂会把指令打进当前那个对话（正在生成时尤其危险）。
+function Switch-Session($item) {
+    if (Test-SessionSelected $item) { return @{ Ok = $true; Err = ''; Item = $item } }
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        $errs = @()
+        try {
+            $item.El.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+            if (Wait-SessionSelected $item) { return @{ Ok = $true; Err = ''; Item = $item } }
+            $errs += 'SelectionItem 无效果'
+        } catch { $errs += $_.Exception.Message }
+        try {
+            $item.El.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            if (Wait-SessionSelected $item) { return @{ Ok = $true; Err = ''; Item = $item } }
+            $errs += 'Invoke 无效果'
+        } catch { $errs += $_.Exception.Message }
+        if ($attempt -eq 1) { return @{ Ok = $false; Err = ($errs -join ' / '); Item = $item } }
+        Start-Sleep -Milliseconds 400
+        $fresh = Get-Controls | Where-Object {
+            $_.Type -eq $item.Type -and (Get-SessionKey $_.Name) -eq $item.Key -and
+            [Math]::Abs($_.Y - $item.Y) -lt 8
+        } | Select-Object -First 1
+        if (-not $fresh) { return @{ Ok = $false; Err = '重扫后找不到同一条会话'; Item = $item } }
+        $fresh | Add-Member -NotePropertyName Key -NotePropertyValue $item.Key -Force
+        $item = $fresh
+    }
+    return @{ Ok = $false; Err = '切换失败'; Item = $item }
+}
+
 # 会话名末尾粘着相对时间（"刚刚" / "2分" / "49天"），一分钟后就变了。
 # 所以匹配前两边都剥掉它：否则存下来的名字下一轮就匹配不上。
 function Get-SessionKey([string]$name) {
@@ -145,11 +201,16 @@ function Get-SessionKey([string]$name) {
 
 $all = Get-Controls -WithClass:($DryRun -and $Json)
 # 会话候选：侧栏里的列表项（ZCode 用 ListItem，DSH 用 TreeItem），名字非空、位于窗口左侧 45% 内
-$winW = ($all | Where-Object { $_.Type -eq 'ControlType.Window' -and $_.W -gt 600 } | Select-Object -First 1).W
-if (-not $winW) { $winW = 1920 }
+# ⚠ X 是屏幕绝对坐标，窗口不一定贴着屏幕左边：必须减去窗口左边界再比，
+#   否则窗口被系统挪到别处（重启后居中 681,282 就是这样）就「候选会话 0 个」，整个投喂停摆。
+# 窗口矩形直接取 $root（就是 Find-TargetWindow 选中的那个窗口），
+# 不在树里找 ControlType.Window：有的应用根本不给 Window 节点，有的还会冒出子窗口。
+$winRect = $root.Current.BoundingRectangle
+$winW = if ($winRect.Width -gt 0) { [double]$winRect.Width } else { 1920 }
+$winX = if ($winRect.Width -gt 0) { [double]$winRect.X } else { 0 }
 $sideItems = @($all | Where-Object {
         ($_.Type -eq 'ControlType.ListItem' -or $_.Type -eq 'ControlType.TreeItem') -and $_.Name -and
-        ($_.X -lt $winW * 0.45) -and $_.W -gt 40 -and $_.H -gt 12
+        (($_.X - $winX) -lt $winW * 0.45) -and $_.W -gt 40 -and $_.H -gt 12
     })
 foreach ($s in $sideItems) {
     $s | Add-Member -NotePropertyName Key -NotePropertyValue (Get-SessionKey $s.Name) -Force
@@ -283,11 +344,9 @@ if ($OpenOnly) {
     if (-not $t -and $sideItems.Count -gt 0) { $t = $sideItems[0] }
     if (-not $t) { [Console]::Error.WriteLine('侧栏里没有可打开的对话'); exit 3 }
     $label = $t.Name.Substring(0, [Math]::Min(26, $t.Name.Length))
-    try { $t.El.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select() }
-    catch {
-        try { $t.El.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
-        catch { [Console]::Error.WriteLine("点不开这个对话：[$label]"); exit 5 }
-    }
+    $sw = Switch-Session $t
+    if (-not $sw.Ok) { [Console]::Error.WriteLine("点不开这个对话：[$label]（$($sw.Err)）"); exit 5 }
+    $t = $sw.Item
     $composer = $null
     for ($w = 0; $w -lt 10 -and -not $composer; $w++) {
         Start-Sleep -Milliseconds 900
@@ -300,11 +359,9 @@ if ($OpenOnly) {
 foreach ($t in $tasks) {
     if ($done -ge $MaxSessions) { break }
     $label = $t.Name.Substring(0, [Math]::Min(26, $t.Name.Length))
-    try { $t.El.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select() }
-    catch {
-        try { $t.El.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
-        catch { Write-Output ("  [$label] 切换失败"); $failed++; continue }
-    }
+    $sw = Switch-Session $t
+    if (-not $sw.Ok) { Write-Output ("  [$label] 切换失败（{0}）" -f $sw.Err); $failed++; continue }
+    $t = $sw.Item
     Start-Sleep -Milliseconds 1600
 
     $items = Get-Controls
