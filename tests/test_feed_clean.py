@@ -42,8 +42,24 @@ def test_feed_clean_accepts_partial_success(monkeypatch):
     assert st.line == []
 
 
-def test_feed_clean_retries_when_nothing_went_in(monkeypatch):
+def test_feed_clean_does_not_retry_when_everyone_is_busy(monkeypatch):
+    """全都「跳过（在忙）」不是失败：没有一条出错，重投只会白等 40 秒。"""
     calls = []
+
+    def fake_feed(cfg, st, prompt, dry_run=False):
+        calls.append(prompt)
+        return 0, "汇总：投喂 0 / 跳过 3 / 失败 0"
+
+    monkeypatch.setattr(zburn, "flush_composer", lambda cfg: None)
+    monkeypatch.setattr(zburn, "feed_once", fake_feed)
+    st = _St()
+    code, _ = zburn.feed_clean({}, st, "continue")
+    assert code == 0
+    assert len(calls) == 1
+    assert st.line == []
+
+
+def test_feed_clean_retries_when_nothing_went_in(monkeypatch):    calls = []
 
     def fake_feed(cfg, st, prompt, dry_run=False):
         calls.append(prompt)

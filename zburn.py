@@ -658,7 +658,10 @@ def feed_clean(cfg: dict, st: State, prompt: str, dry_run: bool = False) -> tupl
     stats = feed_stats(summary)
     if code in (3, 4, 6):                       # 4=指令非法 3=没指定会话 6=结构性问题：重投也一样
         return code, summary
-    if code == 0 and ((stats["done"] or 0) >= 1 or (stats["typed"] or 0) > 0):
+    all_busy = (stats["done"] == 0 and stats["failed_n"] == 0 and (stats["skipped"] or 0) > 0)
+    if code == 0 and (all_busy or (stats["done"] or 0) >= 1 or (stats["typed"] or 0) > 0):
+        # 全部「跳过（在忙）」也算正常：没有一条失败，只是都在生成，下一轮再来。
+        # 这种情况重投只会白等 40 秒，还可能把残留发进正在跑的对话。
         return code, summary
     st.log(f"[feed] 首次未成功（{summary}）→ 腾空输入框后重投")
     flush_composer(cfg)
