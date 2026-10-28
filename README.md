@@ -120,9 +120,13 @@ python zburn.py up --config config.json --host 0.0.0.0 --token <token>   # 守�
 
 三条路，随便挑一条：
 
-1. **面板「参数」卡**：日常那几个（会话正则、间隔、并发、阈值），改完点保存，守护进程下一轮生效。
+1. **面板「参数」卡**：会话正则、间隔、并发、阈值、对话轮换轮数、指令上限、钉死的模型，改完点保存，守护进程下一轮生效。
 2. **面板「高级配置」卡**：应用/网关/额度接口/端口这些，展开填完点保存，直接写回 `config.json`（先备份 `.bak`）。正则写错、端口非法会被挡下来并提示，不会把配置写坏。
 3. **直接编辑 `config.json`**：字段含义见 [docs/配置说明.md](docs/配置说明.md)，`config.example.json` 是带注释的模板。
+
+`config.json` 会自动找：`--config` → 环境变量 `ZBURN_CONFIG` → 当前目录 → `zburn.py` 所在目录 →
+`%LOCALAPPDATA%\zburn\`。都没有才用内置默认值（没有 agents、没有额度源），
+`doctor`/`status` 第一行会打印这次实际读的是哪个文件。
 
 手机上看就是这样：
 
@@ -256,7 +260,9 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 | `inject --text "…" [--dry-run] [--no-enter]` | 直接往输入框投一条 |
 | `feed [--dry-run] [--prompt "…"] [--agent id]` | 投喂一轮 |
 | `run [--dry-run]` | 守护循环（多 agent 调度 / 保活 / 网关 / 额度 / 交接） |
-| `agents` | 列出 agent、角色、监控数、待执行交接 |
+| `agents` | 列出 agent、角色、监控数、轮次、模型状态、待执行交接 |
+| `sessions [--agent id]` | 列出侧栏对话，标出「当前 / 名单内 / 匹配正则」（看它到底会喂谁） |
+| `target --match 片段 \| --add X \| --remove X \| --clear` | 不开面板直接改监控名单 |
 | `newchat --agent zcode --prompt "…"` | 新建对话并投递首条指令（`--dry-run` 只定位） |
 | `handoff --action feed\|new_chat` | 手动写一份监督交接 |
 | `handoff --list / --apply` | 看 / 执行桥里的交接 |
@@ -281,14 +287,16 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 | `prompt.max_chars` | **180** | WM_CHAR 打长了会丢字（实测 400 字符开始翻车）。长指令写进文件让模型自己读，指令只指路 |
 | `feed.rotate_after_turns` | **3** | 一个对话跑满 3 轮就 `new_chat` 换新的。**同一个对话续 200 轮会把上下文滚成天文数字**：同样一句 `continue`，第 1 轮几千 token，第 200 轮几十万，而且模型越来越糊涂 |
 | `feed.interval_seconds` | 120（建议 300） | 每轮都要重发整段历史，喂得越密烧得越快；忙的时候本来就会跳过 |
-| `agents[].model.want` | 如 `zcode2api` | 模型写 `auto` 会按账号池自动路由，可能一直用某几个号、把别的号的额度留着不用 |
+| `agents[].model.want` | 如 `zcode2api` | 模型写 `auto` 会按账号池自动路由，可能一直用某几个号、把别的号的额度留着不用。**新对话不继承上次选的模型**，所以每次新建/轮换后都会复查 |
+| `model.enforce` | **开** | 模型没钉住时这一轮不投喂（日志 `skip:model`）。停一分钟比烧错一整夜划算 |
 | `quota.stop_below` | 见配置 | 到阈值自动收工，别把最后一个号也烧空 |
 
 看是不是在空转：
 
 ```powershell
-python zburn.py status       # 第一行就是「近一小时掉多少 / 约多少 tokens 每小时」
-python zburn.py doctor       # 指令上限、对话轮换、当前模型 三项都会检查
+python zburn.py status       # 第一行：额度速率（数据过期会直说，不会拿旧点冒充「近一小时」）
+python zburn.py doctor       # 配置来源、指令上限、对话轮换、每个 agent 的当前模型
+python zburn.py sessions     # 侧栏里到底哪些对话会被喂（一个「匹配正则」都没有 = 空转）
 ```
 
 `status` 里如果速率很高但任务没推进，基本就是上下文膨胀或者在反复重做——先降频、先轮换。

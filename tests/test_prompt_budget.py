@@ -63,14 +63,25 @@ def test_quota_rate_uses_window(tmp_path):
     # 越接近现在剩余越少：50 分钟前 4000 万 → 10 分钟前 0，掉 4000 万
     rows = [((now - dt.timedelta(minutes=m)).strftime("%Y-%m-%d %H:%M:%S"),
              40_000_000 - (50 - m) * 1_000_000) for m in (50, 30, 10)]
-    rate, drop = zburn.quota_rate(_state_with_history(tmp_path, rows))
-    assert drop == 40_000_000
-    assert rate == 60_000_000        # 4000 万 / (40/60 小时)
+    r = zburn.quota_rate(_state_with_history(tmp_path, rows))
+    assert r["drop"] == 40_000_000
+    assert r["rate"] == 60_000_000        # 4000 万 / (40/60 小时)
+    assert r["stale"] is False
 
 
 def test_quota_rate_needs_two_points(tmp_path):
     rows = [(dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 5)]
-    assert zburn.quota_rate(_state_with_history(tmp_path, rows)) == (None, None)
+    assert zburn.quota_rate(_state_with_history(tmp_path, rows))["rate"] is None
+
+
+def test_quota_rate_marks_stale_old_samples(tmp_path):
+    """采样停了一夜之后不能还标「近一小时」：旧数据要如实说旧。"""
+    old = dt.datetime.now() - dt.timedelta(hours=10)
+    rows = [((old - dt.timedelta(minutes=m)).strftime("%Y-%m-%d %H:%M:%S"), 900 + m)
+            for m in (30, 10)]
+    r = zburn.quota_rate(_state_with_history(tmp_path, rows))
+    assert r["stale"] is True
+    assert r["last_age_minutes"] > 500
 
 def test_supervisor_seed_is_ascii_and_short():
     acfg = {"prompt": {"max_chars": 180}}

@@ -148,13 +148,74 @@ def deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
+def config_candidates() -> list[pathlib.Path]:
+    """自动找配置文件的候选位置（按优先级）。
+
+    以前 `--config` 缺省直接落到内置默认值：在仓库目录里 `python zburn.py status`
+    会显示「额度: 未配置 / agents=1 default」，看着像配置丢了，其实是根本没读文件。
+    现在按「当前目录 → 脚本目录 → 用户配置目录」找，找到就用。
+    """
+    out = [pathlib.Path("config.json")]
+    me = HERE / "config.json"
+    if me not in out:
+        out.append(me)
+    base = os.environ.get("LOCALAPPDATA") or ""
+    if base:
+        out.append(pathlib.Path(base) / "zburn" / "config.json")
+    return out
+
+
+CONFIG_SOURCE = ""          # 最近一次实际读到配置文件（doctor/status 里显示）
+CONFIG_FALLBACK = "<内置默认>"
+
+
+def resolve_config_path(path: str | None) -> pathlib.Path | None:
+    """定下这次要用哪个配置文件：显式参数 > 环境变量 > 候选位置。"""
+    explicit = path or os.environ.get("ZBURN_CONFIG") or ""
+    if explicit:
+        return pathlib.Path(explicit)
+    for c in config_candidates():
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
 def load_config(path: str | None) -> dict:
-    if not path:
+    global CONFIG_SOURCE
+    p = resolve_config_path(path)
+    if p is None:
+        CONFIG_SOURCE = CONFIG_FALLBACK
         return dict(DEFAULT_CONFIG)
-    p = pathlib.Path(path)
     if not p.exists():
         raise SystemExit(f"配置文件不存在: {p}")
-    return deep_merge(DEFAULT_CONFIG, json.loads(p.read_text(encoding="utf-8")))
+    cfg = deep_merge(DEFAULT_CONFIG, json.loads(p.read_text(encoding="utf-8")))
+    try:
+        CONFIG_SOURCE = str(p.resolve())
+    except OSError:
+        CONFIG_SOURCE = str(p)
+    return cfg
+
+
+def config_source() -> str:
+    return CONFIG_SOURCE or CONFIG_FALLBACK
+
+
+def config_path_arg(path: str | None) -> str | None:
+    """给面板/看门狗/batch 传的配置路径：显式给的就用它，否则用自动找到的那份。
+
+    没这条，`python zburn.py panel`（不带 --config）启动的面板是只读的：
+    能看状态，但「保存参数」会因为没有配置文件而失败。
+    """
+    p = resolve_config_path(path)
+    if not p:
+        return None
+    try:
+        return str(p.resolve())
+    except OSError:
+        return str(p)
 
 
 def reload_config(path: str | None, cur: dict) -> dict:
@@ -163,7 +224,8 @@ def reload_config(path: str | None, cur: dict) -> dict:
     读不出来（面板正在写、文件被手改坏、临时删掉）就沿用上一版：
     参数没生效可以下一轮再试，守护不能因为一次读文件失败就退出。
     """
-    if not path or not pathlib.Path(path).exists():
+    p = resolve_config_path(path)
+    if p is None or not p.exists():
         return cur
     try:
         return load_config(path)
@@ -172,6 +234,8 @@ def reload_config(path: str | None, cur: dict) -> dict:
 
 
 class State:
+    LOG_MAX_BYTES = 2_000_000
+
     def __init__(self, cfg: dict):
         self.dir = pathlib.Path(cfg["paths"]["state_dir"])
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -185,6 +249,14 @@ class State:
         line = f"{now()} | {msg}"
         print(line, flush=True)
         try:
+            # 一夜跑下来日志能到几十万行，磁盘写满会把整台机器拖死：超过阈值留一份 .1
+            if self.log_path.exists() and self.log_path.stat().st_size > self.LOG_MAX_BYTES:
+                old = self.log_path.with_name(self.log_path.name + ".1")
+                try:
+                    old.unlink(missing_ok=True)
+                    self.log_path.rename(old)
+                except OSError:
+                    pass
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except OSError:
@@ -654,7 +726,8 @@ def scan_sessions(cfg: dict) -> tuple[list[dict], str]:
 
 def new_chat_once(cfg: dict, st: State, prompt: str, *, project: str = "",
                   dry_run: bool = False, click_only: bool = False,
-                  agent_id: str = "", clear_residual: bool = False, force: bool = False) -> tuple[int, str]:
+                  agent_id: str = "", clear_residual: bool = False, force: bool = False,
+                  replace_targets: bool = True) -> tuple[int, str]:
     """点「新建任务/新对话」→ 输入首条指令 → 提交。"""
     nc = cfg.get("new_chat") or {}
     if not nc.get("enabled", True):
@@ -687,7 +760,22 @@ def new_chat_once(cfg: dict, st: State, prompt: str, *, project: str = "",
     for ln in lines[:-1][-4:]:
         st.log("  " + ln)
     if code == 0 and not dry_run and not click_only:
-        capture_active_session(cfg, st, agent_id)
+        # 新对话就是「旧的翻篇了」：把上一批的动态监控名单清掉。
+        # 不清的话名单只增不减，几轮之后「继续」被喂给一堆早已过时的对话，
+        # 每个都在滚上下文，额度照样白烧。
+        if replace_targets and agent_id:
+            old = agentlib.load_dynamic_targets(st, agent_id)
+            if old:
+                agentlib.clear_dynamic_targets(st, agent_id)
+                st.log(f"[{agent_id}] 已切换对话 → 清空旧监控名单 {len(old)} 个（{old[0][:40]}…）")
+        # 监督者的新对话靠 session_regex 匹配（标题就是 seed 那句），
+        # 不需要往动态名单里塞 —— 那份名单只有 worker 会读。
+        if cfg.get("agent_role") != agentlib.SUPERVISOR:
+            capture_active_session(cfg, st, agent_id)
+            ok, msg = model_guard(cfg, st, agent_id)
+            if ok is False:
+                st.log(f"[{agent_id}] 新对话的模型没钉住：{msg}"
+                       "（下一轮会再试；解锁桌面能自动切回）")
     return code, summary
 
 
@@ -1051,6 +1139,21 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
     rotate_after = int(acfg["feed"].get("rotate_after_turns") or 0)
     stt = agentlib.read_state(st, aid) or {}
     turns = int(stt.get("turns_on_target") or 0)
+
+    # 3a) 模型守卫：模型不对时宁可这一轮空着，也别继续把额度烧在别的模型上
+    m = acfg.get("model") or {}
+    want = str(m.get("want") or "").strip()
+    if want and not dry_run:
+        every = max(1, int(m.get("check_every") or 10))
+        if stt.get("model_ok") is False or turns % every == 0:
+            ok, mmsg = model_guard(acfg, st, aid)
+            if ok is False and m.get("enforce", True):
+                st.log(f"[{aid}] 模型不对（{mmsg}）→ 本轮不投喂"
+                       "：先把模型钉回去，否则额度会烧到别的模型上")
+                agentlib.update_state(st, aid, last_run=now(), last_action="skip",
+                                      last_result=f"model: {mmsg}")
+                return 0, f"skip:model {mmsg}"
+
     if rotate_after > 0 and turns >= rotate_after:
         seed = pathlib.Path(acfg["prompt"].get("file") or "next-prompt.txt")
         if not seed.is_absolute():
@@ -1187,7 +1290,12 @@ def acquire_scheduler(tag: str) -> bool:
 def cmd_doctor(a) -> int:
     cfg = load_config(a.config)
     st = State(cfg)
-    print(f"zburn {VERSION}  配置: {a.config or '<内置默认>'}")
+    src = config_source()
+    print(f"zburn {VERSION}  配置: {src}")
+    if src == CONFIG_FALLBACK:
+        print("     ↑ 没找到 config.json（会在当前目录/脚本目录找）。"
+              "用内置默认值跑会没有 agents、没有额度源 —— 用 --config 指一份，"
+              "或把 config.example.json 复制成当前目录的 config.json。")
     print(f"平台: {sys.version.split()[0]} / {'Windows' if IS_WIN else os.name}")
     print(f"状态目录: {st.dir.resolve()}")
 
@@ -1245,16 +1353,20 @@ def cmd_doctor(a) -> int:
     print(f"[{'OK ' if rot else 'WARN'}] 对话轮换："
           + (f"每个对话跑满 {rot} 轮就换新对话" if rot else "未开启（长时间续同一个对话会让上下文越滚越大、白烧额度）"))
     if ok_app:
-        cur = probe_model(cfg)
-        want = ""
+        # 每个配了 model.want 的 agent 各自探一次：不同应用、不同窗口，不能共用一个结果
         for spec in agentlib.agent_specs(cfg):
-            if (spec.get("model") or {}).get("want"):
-                want = spec["model"]["want"]
-                break
-        if cur:
-            bad = bool(want) and want not in cur
-            print(f"[{'WARN' if bad else 'OK '}] 当前模型：{cur}"
-                  + (f"（期望含 '{want}'，用 zburn model --set 切换，需解锁桌面）" if bad else ""))
+            want = str((spec.get("model") or {}).get("want") or "").strip()
+            if not want:
+                continue
+            acfg = agentlib.agent_view(cfg, spec, st)
+            if not app_running(acfg):
+                continue
+            cur = probe_model(acfg)
+            bad = bool(cur) and want not in cur
+            tag = "WARN" if bad else ("OK " if cur else "-- ")
+            print(f"[{tag}] {spec['id']} 当前模型：{cur or '读不到模型按钮'}"
+                  + (f"（期望含 '{want}'：解锁后 zburn model --agent {spec['id']} --set）"
+                     if bad else ""))
     print(f"[OK ] 脚本目录: {SCRIPTS}（{len(list(SCRIPTS.glob('*.ps1')))} 个 ps1）")
     return 0 if ok_app else 1
 
@@ -1268,13 +1380,20 @@ def cmd_quota(a) -> int:
     return 0 if remaining is not None else 1
 
 
-def quota_rate(st: State, minutes: int = 60) -> tuple[float | None, int | None]:
-    """最近 N 分钟的额度消耗速率（tokens/小时）与窗口内的降幅。"""
+def quota_rate(st: State, minutes: int = 60) -> dict:
+    """最近 N 分钟的额度消耗速率（tokens/小时）。
+
+    以前不管数据多旧都拿最后两个点算，然后把标签写成「近一小时」——
+    采样停了一整夜之后再跑 status，会拿 10 小时前的两个点冒充「近一小时」。
+    现在把真实跨度和数据年龄一起返回，谁看都不会被误导。
+    """
+    empty = {"rate": None, "drop": None, "span_minutes": None,
+             "last_age_minutes": None, "stale": True, "samples": 0}
     try:
         rows = [ln.split(",") for ln in
                 st.quota_csv.read_text(encoding="utf-8-sig").splitlines()[1:] if ln.strip()]
     except OSError:
-        return None, None
+        return empty
     pts: list[tuple[float, int]] = []
     for r in rows:
         if len(r) < 2 or not r[1].strip().isdigit():
@@ -1285,36 +1404,61 @@ def quota_rate(st: State, minutes: int = 60) -> tuple[float | None, int | None]:
             continue
         pts.append((ts, int(r[1])))
     if len(pts) < 2:
-        return None, None
-    now = time.time()
-    win = [p for p in pts if now - p[0] <= minutes * 60] or pts[-2:]
+        return empty
+    t_now = time.time()
+    last_age = (t_now - pts[-1][0]) / 60
+    win = [p for p in pts if t_now - p[0] <= minutes * 60]
+    if len(win) < 2:                     # 窗口里点太少：用最后两个点，但如实标跨度
+        win = pts[-2:]
     (t0, v0), (t1, v1) = win[0], win[-1]
     drop = v0 - v1
-    hours = max((t1 - t0) / 3600, 1e-6)
-    return drop / hours, drop
+    span = max((t1 - t0) / 60, 1e-6)
+    return {"rate": drop / (span / 60), "drop": drop, "span_minutes": span,
+            "last_age_minutes": last_age, "stale": last_age > 2 * minutes,
+            "samples": len(pts)}
 
 
 def cmd_status(a) -> int:
     cfg = load_config(a.config)
     st = State(cfg)
-    rate, drop = quota_rate(st)
-    if rate is not None:
-        print(f"额度速率: 近一小时掉 {drop:,}，约 {int(rate):,} tokens/小时"
-              + ("  ← 没有产出还这么烧就说明在空转" if rate > 5_000_000 else ""))
+    print(f"配置: {config_source()}")
+    r = quota_rate(st)
+    if r["rate"] is None:
+        print("额度速率: 样本不足（至少要有两个采样点）")
+    elif r["stale"]:
+        print(f"额度速率: 不估算 —— 最后一次采样在 {r['last_age_minutes']:.0f} 分钟前"
+              "（采样只在 run 里做，守护没跑时不更新）")
+    else:
+        print(f"额度速率: 近 {r['span_minutes']:.0f} 分钟掉 {r['drop']:,}，"
+              f"约 {int(r['rate']):,} tokens/小时"
+              + ("  ← 没有产出还这么烧就说明在空转" if r["rate"] > 5_000_000 else ""))
     if st.status_path.exists():
-        print(json.dumps(json.loads(st.status_path.read_text(encoding="utf-8")), ensure_ascii=False, indent=1))
+        raw = st.status_path.read_text(encoding="utf-8")
+        print(json.dumps(json.loads(raw), ensure_ascii=False, indent=1))
+        try:
+            upd = dt.datetime.strptime(json.loads(raw).get("updated", ""),
+                                       "%Y-%m-%d %H:%M:%S").timestamp()
+            age_min = (time.time() - upd) / 60
+            if age_min > 5:
+                print(f"⚠ 这份状态是 {age_min:.0f} 分钟前写的：守护进程现在没在跑，"
+                      "上面是上次收工时的快照")
+        except (ValueError, TypeError):
+            pass
     else:
         print("还没有 status.json（没跑过 run）")
     hb = st.heartbeat_path
     if hb.exists():
         age = int(time.time()) - int(hb.read_text() or 0)
-        print(f"心跳: {age} 秒前")
+        print(f"心跳: {age} 秒前" + ("（陈旧）" if age > 300 else ""))
     print("\nAgents:")
     for ag in agentlib.describe(cfg, st):
         pending = ag.get("pending") or {}
+        extra = f"  pending={pending.get('action')}" if pending else ""
+        if ag.get("model_ok") is False and ag.get("last_model"):
+            extra += f"  模型未钉死：{ag['last_model']}"
         print(f"  [{'on' if ag['enabled'] else 'off'}] {ag['id']:14} {ag['role']:10} "
               f"{ag['process_name']:20} {ag['last_result'][:60] if ag['last_result'] else '-'}"
-              + (f"  pending={pending.get('action')}" if pending else ""))
+              + extra)
     if st.log_path.exists():
         lines = st.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         print(f"\n最近 15 行日志（共 {len(lines)} 行）：")
@@ -1510,7 +1654,7 @@ def cmd_watchdog(a) -> int:
         log_f = open(st.dir / "supervisor.out", "a", encoding="utf-8")
         args = [sys.executable, str(pathlib.Path(__file__).resolve()), "run"]
         if a.config:
-            args += ["--config", a.config]
+            args += ["--config", config_path_arg(a.config) or a.config]
         subprocess.Popen(args, stdout=log_f, stderr=log_f,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         time.sleep(max(30, stale // 2))
@@ -1577,7 +1721,7 @@ def cmd_panel(a) -> int:
     print_endpoints(host, port, token)
     if getattr(a, "open", False):
         open_browser(url)
-    return panel.serve(cfg, host=host, port=port, token=token, config_path=a.config)
+    return panel.serve(cfg, host=host, port=port, token=token, config_path=config_path_arg(a.config))
 
 
 def cmd_up(a) -> int:
@@ -1602,7 +1746,7 @@ def cmd_up(a) -> int:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         args = [sys.executable, str(pathlib.Path(__file__).resolve()), "watchdog"]
         if a.config:
-            args += ["--config", a.config]
+            args += ["--config", config_path_arg(a.config) or a.config]
         subprocess.Popen(args, stdout=open(st.dir / "watchdog.out", "a", encoding="utf-8"),
                          stderr=subprocess.STDOUT, creationflags=flags)
         print("看门狗: 已启动")
@@ -1616,7 +1760,7 @@ def cmd_up(a) -> int:
     print_endpoints(host, port, token)
     if not a.no_browser:
         open_browser(url)
-    return panel.serve(cfg, host=host, port=port, token=token, config_path=a.config)
+    return panel.serve(cfg, host=host, port=port, token=token, config_path=config_path_arg(a.config))
 
 
 def cmd_restart_app(a) -> int:
@@ -1663,14 +1807,24 @@ def cmd_agents(a) -> int:
     st = State(cfg)
     specs = agentlib.agent_specs(cfg)
     sup, work = agentlib.orchestrator(cfg)
-    print(f"zburn {VERSION}  agents={len(specs)}  bridge={agentlib.bridge_dir(cfg)}")
+    print(f"zburn {VERSION}  agents={len(specs)}  配置={config_source()}")
+    print(f"bridge={agentlib.bridge_dir(cfg)}")
     print(f"{'':3} {'id':14} {'role':10} {'process':20} {'间隔':>7}  监控")
     for s in specs:
         state = agentlib.read_state(st, s["id"])
         pending = agentlib.get_pending(st, s["id"])
         flag = "on" if s.get("enabled", True) else "off"
         targets = s["feed"].get("targets") or []
+        dyn = agentlib.load_dynamic_targets(st, s["id"])
         extra = f"targets={len(targets)}"
+        if dyn:
+            extra += f"+动态{len(dyn)}"
+        turns = int(state.get("turns_on_target") or 0)
+        if turns:
+            extra += f" 轮次={turns}"
+        if state.get("last_model"):
+            ok = state.get("model_ok")
+            extra += f" 模型={'OK' if ok else '✗' if ok is False else '?'}"
         if pending:
             extra += f" pending={pending['action']}"
         if state.get("last_result"):
@@ -1681,6 +1835,88 @@ def cmd_agents(a) -> int:
     rec, src = agentlib.read_handoff(cfg, st, work["id"] if work else "")
     print("待处理交接: " + (json.dumps(rec, ensure_ascii=False) if rec else "无")
           + (f"（{src}）" if src else ""))
+    return 0
+
+
+def _worker_spec(cfg: dict, agent: str | None) -> dict:
+    spec = agentlib.find_agent(cfg, agent)
+    if spec:
+        return spec
+    return agentlib.orchestrator(cfg)[1] or agentlib.agent_specs(cfg)[0]
+
+
+def cmd_sessions(a) -> int:
+    """列出侧栏里的对话，标出「当前/在名单里/匹配正则」，方便确定要盯哪个。"""
+    cfg = load_config(a.config)
+    st = State(cfg)
+    spec = _worker_spec(cfg, getattr(a, "agent", None))
+    acfg = agentlib.agent_view(cfg, spec, st)
+    sessions, msg = scan_sessions(acfg)
+    rx = (acfg["uia"].get("session_regex") or "").strip()
+    targets = feed_targets(acfg)
+    print(f"[{spec['id']}] {msg}")
+    print(f"会话正则: {('/' + rx + '/') if rx else '（空）'}")
+    print(f"监控名单: {'、'.join(targets) if targets else '（空）'}")
+    if not sessions:
+        print("\n没扫到会话：应用没开、侧栏没渲染，或无障碍树不可用（先 zburn doctor）")
+        return 1
+    print("")
+    for i, s in enumerate(sessions, 1):
+        name = s.get("name") or ""
+        marks = []
+        if s.get("active"):
+            marks.append("当前")
+        if name in targets:
+            marks.append("名单内")
+        if rx:
+            try:
+                if re.search(rx, name):
+                    marks.append("匹配正则")
+            except re.error:
+                pass
+        print(f"{i:3}. {name[:58]:58} {'/'.join(marks)}")
+    print("\n指定监控：zburn target --match <标题片段>   或   zburn target --add \"<完整标题>\"")
+    return 0
+
+
+def cmd_target(a) -> int:
+    """看/改某个 agent 的监控名单（不开面板也能改）。"""
+    cfg = load_config(a.config)
+    st = State(cfg)
+    spec = _worker_spec(cfg, getattr(a, "agent", None))
+    acfg = agentlib.agent_view(cfg, spec, st)
+    aid = spec["id"]
+    cur = agentlib.load_dynamic_targets(st, aid)
+    static = [str(t) for t in (spec["feed"].get("targets") or []) if str(t)]
+    rx = (spec["uia"].get("session_regex") or "").strip()
+
+    if a.clear:
+        cur = agentlib.set_dynamic_targets(st, aid, [])
+        print(f"[{aid}] 已清空动态监控名单")
+    if a.match:
+        sessions, msg = scan_sessions(acfg)
+        picked = [s["name"] for s in sessions if a.match in (s.get("name") or "")]
+        if not picked:
+            print(f"[{aid}] 没扫到标题含 '{a.match}' 的对话（{msg}）")
+            return 1
+        cur = agentlib.set_dynamic_targets(st, aid, picked)
+        print(f"[{aid}] 按 '{a.match}' 选中 {len(picked)} 个对话")
+    if a.add:
+        cur = agentlib.set_dynamic_targets(st, aid, cur + [a.add])
+        print(f"[{aid}] 已加入：{a.add}")
+    if a.remove:
+        cur = agentlib.set_dynamic_targets(st, aid, [t for t in cur if t != a.remove])
+        print(f"[{aid}] 已移除：{a.remove}")
+
+    eff = static + [t for t in cur if t not in static]
+    print(f"[{aid}] 静态名单 {len(static)} 个 / 动态名单 {len(cur)} 个 / 会话正则 "
+          f"{('/' + rx + '/') if rx else '（空）'}")
+    for t in cur:
+        print(f"   - {t}")
+    if not eff and not rx:
+        print("⚠ 名单和正则都是空的 → 这个 agent 不会投喂任何东西（这是「空转」的常见原因）")
+    elif not cur and rx:
+        print(f"（名单为空，靠正则 /{rx}/ 匹配）")
     return 0
 
 
@@ -1707,7 +1943,8 @@ def cmd_newchat(a) -> int:
                                   project=a.project or acfg["new_chat"].get("project", ""),
                                   dry_run=a.dry_run, click_only=a.click_only,
                                   agent_id=spec["id"], clear_residual=a.clear_residual,
-                                  force=bool(getattr(a, "force", False)))
+                                  force=bool(getattr(a, "force", False)),
+                                  replace_targets=not getattr(a, "keep_targets", False))
     st.log(f"[{spec['id']}] 新建对话（dry-run={a.dry_run}）：{summary}")
     st.status(last_new_chat=now(), last_new_chat_summary=summary)
     print(summary)
@@ -1828,8 +2065,47 @@ def cmd_autopilot(a) -> int:
     if not acquire_scheduler("autopilot"):
         return 4
     return autopilot.run(cfg, st, a.queue, a.target or feed_targets(cfg), shards=a.shards,
-                         max_per_shard=a.max, config_path=a.config,
+                         max_per_shard=a.max, config_path=config_path_arg(a.config),
                          poll=a.poll, max_hours=a.hours)
+
+
+def model_guard(cfg: dict, st: State, agent_id: str, *, auto: bool | None = None) -> tuple[bool | None, str]:
+    """确认当前对话还是「钉死」的那个模型；不是就尝试切回去。
+
+    为什么每次新建对话都要查一遍：ZCode 的模型选择是跟对话走的，新开一个对话不一定
+    继承上次选的那个，默认会走 `magpie/auto/...`。auto 由网关自己挑「有额度的桶」，
+    看起来一直在干活，额度却烧在另一个模型上（实测一夜 GLM-5.2 走了 95 次，
+    而专门留的 5M 新桶一次没动）。轮换（每 3 轮一次）会让这件事反复发生。
+
+    返回 (True/False/None, 说明)；None = 读不到模型按钮，无法判断（不阻塞干活）。
+    """
+    m = (cfg.get("model") or {})
+    want = str(m.get("want") or "").strip()
+    if not want:
+        return None, "未配置 model.want（不校验）"
+    if auto is None:
+        auto = bool(m.get("auto_pin", True))
+    cur = probe_model(cfg)
+    if not cur:
+        agentlib.update_state(st, agent_id, model_ok=None)
+        return None, "读不到模型按钮（跳过校验）"
+    if want in cur:
+        agentlib.update_state(st, agent_id, model_ok=True, last_model=cur)
+        return True, f"OK {cur}"
+    if auto and not desktop_locked():
+        run_ps("pick-model.ps1", {"ProcessName": cfg["app"]["process_name"], "Wanted": want},
+               timeout=180)
+        cur2 = probe_model(cfg)
+        if cur2 and want in cur2:
+            st.log(f"[{agent_id}] 模型已钉回：{cur2}")
+            agentlib.update_state(st, agent_id, model_ok=True, last_model=cur2)
+            return True, f"已钉回 {cur2}"
+        cur = cur2 or cur
+    # 锁屏时点不动 Radix 下拉，只能记下来让人解锁后处理
+    st.log(f"[{agent_id}] ⚠ 模型没钉住：当前 '{cur}'，期望含 '{want}'"
+           + ("（锁屏切不了，解锁后跑 zburn model --set）" if desktop_locked() else ""))
+    agentlib.update_state(st, agent_id, model_ok=False, last_model=cur)
+    return False, f"未钉住（{cur}）"
 
 
 def probe_model(cfg: dict) -> str:
@@ -1923,6 +2199,18 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("agents", help="列出多 agent 配置与状态").set_defaults(func=cmd_agents)
 
+    p = sub.add_parser("sessions", help="列出侧栏对话（确定要盯哪个）")
+    p.add_argument("--agent", default=None, help="看哪个 agent 的窗口（默认 worker）")
+    p.set_defaults(func=cmd_sessions)
+
+    p = sub.add_parser("target", help="看/改监控名单")
+    p.add_argument("--agent", default=None, help="改哪个 agent（默认 worker）")
+    p.add_argument("--match", default="", help="选中所有标题含该片段的对话（替换名单）")
+    p.add_argument("--add", default="", help="追加一个完整标题")
+    p.add_argument("--remove", default="", help="移除一个标题")
+    p.add_argument("--clear", action="store_true", help="清空动态名单")
+    p.set_defaults(func=cmd_target)
+
     p = sub.add_parser("newchat", help="新建一个对话并投递首条指令")
     p.add_argument("--agent", default=None, help="目标 agent（默认 worker）")
     p.add_argument("--prompt", default=None, help="首条指令（ASCII）")
@@ -1932,6 +2220,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--clear-residual", action="store_true",
                    help="输入框有残留时用 SetValue 清空（只在你确认那是自己的草稿时用）")
     p.add_argument("--force", action="store_true", help="当前会话正在生成也照样新建对话")
+    p.add_argument("--keep-targets", action="store_true",
+                   help="保留旧的监控名单（默认会清掉：新对话=旧的翻篇了）")
     p.set_defaults(func=cmd_newchat)
 
     p = sub.add_parser("handoff", help="写/看/执行监督交接")

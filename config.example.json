@@ -27,12 +27,20 @@
       "Keep going on the current task. No recap, next batch now.",
       "Continue. Same task, do not stop to explain."
     ],
-    "file": "next-prompt.txt"
+    "file": "next-prompt.txt",
+    "max_chars": 180
   },
   "feed": {
     "max_sessions": 5,
     "interval_seconds": 120,
-    "targets": []
+    "targets": [],
+    "rotate_after_turns": 3
+  },
+  "model": {
+    "want": "zcode2api",
+    "auto_pin": true,
+    "enforce": true,
+    "check_every": 10
   },
   "gateway": {
     "health_url": "http://127.0.0.1:3000/meta",

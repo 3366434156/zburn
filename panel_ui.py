@@ -302,6 +302,14 @@ input:hover,textarea:hover{border-color:#2c3a4d}
         <div><label>并发上限</label><input id="cfgMax" type="number" min="1" max="12"></div>
         <div><label>额度阈值</label><input id="cfgStop" type="number" min="0" step="100000"></div>
       </div>
+      <div class="g3">
+        <div><label>对话轮换(轮) <b>0=不换</b></label><input id="cfgRotate" type="number" min="0" step="1" placeholder="3"></div>
+        <div><label>指令上限(字符)</label><input id="cfgMaxChars" type="number" min="0" step="10" placeholder="180"></div>
+        <div><label>钉死的模型</label><input id="cfgModelWant" placeholder="zcode2api"></div>
+      </div>
+      <div class="hint">轮换：一个对话跑满这么多轮就换新的（上下文平方级膨胀，不换就是白烧额度）。
+        指令上限：WM_CHAR 打太长会丢字，超出的部分会被截掉。钉死的模型：新对话后自动复查，
+        不对就切回去；切不回去宁可这一轮不投喂。</div>
     </div>
     <div class="btnrow" style="grid-template-columns:1fr">
       <button class="btn" onclick="saveCfg()">保存参数</button>
@@ -585,6 +593,9 @@ async function saveCfg(){
     window_title_regex: val('cfgWinTitle'),
     interval_seconds: +val('cfgInterval'),
     max_sessions: +val('cfgMax'),
+    rotate_after_turns: +val('cfgRotate'),
+    prompt_max_chars: +val('cfgMaxChars'),
+    model_want: val('cfgModelWant'),
     stop_below: +val('cfgStop'),
     process_name: val('cfgProc'),
     app_exe: val('cfgExe'),
@@ -601,7 +612,7 @@ async function saveCfg(){
     panel_port: +val('cfgPort')
   };
   // 会话正则/窗口正则允许清空（清空=只喂勾选的会话），其余空值照旧跳过
-  const clearable = ['session_regex', 'window_title_regex', 'new_chat_project', 'bridge_dir'];
+  const clearable = ['session_regex', 'window_title_regex', 'new_chat_project', 'bridge_dir', 'model_want'];
   Object.keys(body).forEach(k => {
     if((body[k]==='' || Number.isNaN(body[k])) && !clearable.includes(k)) delete body[k];
   });
@@ -799,6 +810,9 @@ async function load(){
     set('cfgWinTitle', s.config.window_title_regex);
     set('cfgInterval', s.config.interval_seconds);
     set('cfgMax', s.config.max_sessions);
+    set('cfgRotate', s.config.rotate_after_turns);
+    set('cfgMaxChars', s.config.prompt_max_chars);
+    set('cfgModelWant', s.config.model_want);
     set('cfgStop', s.config.stop_below);
     set('cfgProc', s.config.process_name);
     set('cfgExe', s.config.app_exe);

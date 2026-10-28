@@ -52,6 +52,13 @@ DEFAULT_NEW_CHAT = {
     "clear_residual": False,
 }
 
+DEFAULT_MODEL = {
+    "want": "",            # 名字里要包含的字样，例如 "zcode2api"；空=不校验
+    "auto_pin": True,      # 发现没钉死就尝试切回去（需要解锁桌面能点下拉）
+    "enforce": True,       # 切不回去时宁可这一轮不投喂，也别把额度烧在别的模型上
+    "check_every": 10,     # 每 N 轮复检一次，防中途漂移
+}
+
 DEFAULT_SUPERVISOR_PROMPT = (
     "You are the zburn supervisor. Read {context} (the worker's session tail), "
     "{status} (runtime state and recent log), and the task description. "
@@ -156,6 +163,11 @@ def normalize_agent(cfg: dict, raw, index: int = 0, *, is_default: bool = False)
         "feed": feed,
         "prompt": prompt,
         "new_chat": new_chat,
+        # model 以前没被带出来：agents[].model.want 就算写了也到不了
+        # agent_view / cmd_model / 新对话后的校验，等于「配了但没生效」。
+        # 顶层 model 当默认值，agent 自己写的覆盖它。
+        "model": _deep_merge(_deep_merge(DEFAULT_MODEL, cfg.get("model") or {}),
+                             raw.get("model") or {}),
         "supervises": str(raw.get("supervises") or "").strip(),
     }
 
@@ -225,6 +237,7 @@ def agent_view(cfg: dict, spec: dict, st=None, *, include_dynamic: bool = True) 
     for sec in ("app", "uia", "feed", "prompt"):
         view[sec] = copy.deepcopy(spec[sec])
     view["new_chat"] = copy.deepcopy(spec.get("new_chat") or DEFAULT_NEW_CHAT)
+    view["model"] = copy.deepcopy(spec.get("model") or DEFAULT_MODEL)
     view["agent_id"] = spec["id"]
     view["agent_name"] = spec["name"]
     view["agent_role"] = spec["role"]
@@ -265,6 +278,18 @@ def add_dynamic_target(st, agent_id: str, target: str) -> bool:
 
 def clear_dynamic_targets(st, agent_id: str) -> None:
     _agent_file(st, agent_id, "targets.json").unlink(missing_ok=True)
+
+
+def set_dynamic_targets(st, agent_id: str, targets: list[str]) -> list[str]:
+    """直接设定动态监控名单（命令行 zburn target 用）。"""
+    cur = [str(t).strip() for t in (targets or []) if str(t).strip()]
+    p = _agent_file(st, agent_id, "targets.json")
+    if not cur:
+        p.unlink(missing_ok=True)
+        return []
+    p.write_text(json.dumps({"targets": cur, "updated": _now()},
+                            ensure_ascii=False, indent=1), encoding="utf-8")
+    return cur
 
 
 # ---------------------------------------------------------------- agent 状态
@@ -309,6 +334,10 @@ def describe(cfg: dict, st) -> list[dict]:
             "last_result": state.get("last_result", ""),
             "last_action": state.get("last_action", ""),
             "last_run": state.get("last_run", ""),
+            "turns_on_target": state.get("turns_on_target", 0),
+            "last_model": state.get("last_model", ""),
+            "model_ok": state.get("model_ok"),
+            "model_want": (s.get("model") or {}).get("want", ""),
             "pending": pending,
         })
     return out
@@ -443,7 +472,9 @@ def _normalize_handoff(data: dict, default_agent: str = "") -> dict | None:
         "prompt": prompt,
         "agent": str(data.get("agent") or default_agent or "").strip(),
         "project": str(data.get("project") or "").strip(),
-        "created": str(data.get("created") or _now()),
+        # 文件里没写 created 就别替它编一个：以前读一次就盖一个新时间，
+        # 交接等待多久完全看不出来（每次读都显示「刚刚写的」）。
+        "created": str(data.get("created") or ""),
     }
 
 
@@ -527,8 +558,16 @@ def clear_handoff(cfg: dict, st) -> int:
 
 def handoff_status(cfg: dict, st, default_agent: str = "") -> dict:
     rec, src = read_handoff(cfg, st, default_agent)
+    age = None
+    if rec and rec.get("created"):
+        try:
+            age = int(time.time() - dt.datetime.strptime(
+                rec["created"], "%Y-%m-%d %H:%M:%S").timestamp())
+        except ValueError:
+            age = None
     return {
         "pending": rec,
+        "age_seconds": age,
         "source": src,
         "bridge": str(bridge_dir(cfg)),
         "prompt": supervisor_prompt(cfg, *orchestrator(cfg)),
