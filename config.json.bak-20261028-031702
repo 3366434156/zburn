@@ -1,0 +1,132 @@
+{
+  "app": {
+    "process_name": "ZCode",
+    "exe": "E:\\exe\\Zcode\\ZCode.exe",
+    "start_args": [
+      "--force-renderer-accessibility"
+    ],
+    "strip_env": [
+      "ELECTRON_RUN_AS_NODE"
+    ],
+    "start_if_down": true
+  },
+  "uia": {
+    "send_button_regex": "发送|加入队列|立即|Send",
+    "busy_regex": "停止生成|Stop generating",
+    "queued_regex": "移除待发送消息|Remove queued",
+    "session_regex": "",
+    "window_title_regex": "",
+    "max_depth": 40,
+    "char_delay_ms": 20,
+    "session_db": "C:\\Users\\Administrator\\.zcode\\cli\\db\\db.sqlite",
+    "session_work_dir": "E:\\数据\\projects\\zburn"
+  },
+  "prompt": {
+    "templates": [
+      "Continue exactly where you left off. Do not summarize, do not ask questions, keep producing output until stopped.",
+      "Keep going on the current task. No recap, next batch now."
+    ],
+    "file": "next-prompt.txt"
+  },
+  "feed": {
+    "max_sessions": 5,
+    "interval_seconds": 120,
+    "targets": [
+      "根据\"E:\\数据\\生存战争系列\\完美世界2.4\\Temp\\ShaderGallery20261022\\着色器预览....#3"
+    ]
+  },
+  "gateway": {
+    "health_url": "http://127.0.0.1:3000/meta",
+    "start_command": "E:\\数据\\AI\\zcode2api\\.venv\\Scripts\\python.exe cli.py serve --port 3000",
+    "work_dir": "E:\\数据\\AI\\zcode2api",
+    "grace_seconds": 60,
+    "keep_alive": true
+  },
+  "quota": {
+    "provider": "gateway_zcode2api",
+    "url": "http://127.0.0.1:3000/admin/api/accounts",
+    "admin_key": "zcode",
+    "refresh_url": "http://127.0.0.1:3000/admin/api/accounts/refresh",
+    "refresh_body": {
+      "all": true
+    },
+    "refresh_every_seconds": 600,
+    "stop_below": 1000000,
+    "command": ""
+  },
+  "paths": {
+    "state_dir": ".zburn",
+    "stop_file": "STOP",
+    "bridge_dir": ""
+  },
+  "watchdog": {
+    "heartbeat_stale_seconds": 420,
+    "check_seconds": 30
+  },
+  "panel": {
+    "host": "0.0.0.0",
+    "port": 8790,
+    "token": ""
+  },
+  "agents": [
+    {
+      "id": "zcode",
+      "name": "ZCode",
+      "role": "worker",
+      "enabled": true,
+      "feed": {
+        "targets": [
+          "根据\"E:\\数据\\生存战争系列\\完美世界2.4\\Temp\\ShaderGallery20261022\\着色器预览....#3"
+        ]
+      }
+    },
+    {
+      "id": "dsh",
+      "name": "dsh",
+      "role": "supervisor",
+      "enabled": true,
+      "supervises": "zcode",
+      "app": {
+        "process_name": "DeepSeek Harness",
+        "exe": "E:\\exe\\DeepSeek Harness\\DeepSeek Harness.exe",
+        "start_args": [
+          "--force-renderer-accessibility"
+        ],
+        "strip_env": [
+          "ELECTRON_RUN_AS_NODE"
+        ],
+        "start_if_down": true
+      },
+      "uia": {
+        "send_button_regex": "发送|Send",
+        "busy_regex": "停止|Stop",
+        "queued_regex": "排队|Queue",
+        "session_regex": "一键部署功能实现与排查",
+        "window_title_regex": "",
+        "session_db": null,
+        "session_work_dir": ""
+      },
+      "feed": {
+        "targets": [],
+        "interval_seconds": 600,
+        "max_sessions": 1
+      },
+      "prompt": {
+        "file": "supervisor-prompt.txt"
+      }
+    }
+  ],
+  "orchestrator": {
+    "enabled": true,
+    "supervisor": "dsh",
+    "worker": "zcode",
+    "prompt": "Supervisor duty: read {status}, {context} (worker chat tail) and the goal in {bridge}\\task.txt. If the worker is still working, write nothing and reply WAIT. If it needs correction, write {handoff} as {\"action\":\"feed\",\"prompt\":\"<one-line ASCII instruction>\"}. If this batch is accepted and a fresh chat should start, write {\"action\":\"new_chat\",\"prompt\":\"<one-line ASCII task>\"}. Then reply DONE.",
+    "handoff_wait_seconds": 120
+  },
+  "new_chat": {
+    "enabled": true,
+    "button_regex": "新建任务|新建对话|新对话|新聊天|新建会话|New chat|New task|New conversation",
+    "project": "完美世界2.4",
+    "send_button_regex": ""
+  }
+}

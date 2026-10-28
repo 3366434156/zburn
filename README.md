@@ -267,7 +267,31 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 | `panel` / `up` | 起可视化面板 / 一键全起（网关+守护+看门狗+面板） |
 | `gateway` | 只探活，必要时按配置拉起网关（绝不重启） |
 | `token` | 生成面板 token |
+| `model [--agent id] [--want zcode2api] [--set]` | 看/校验/切换当前对话的模型（`auto` 路由会白烧额度，建议钉死） |
+| `batch --queue q.json` | 队列驱动：投喂 → 等文件改动 → 跑验收命令 → 记账（失败重试、断点续跑） |
+| `autopilot --queue q.json --target …` | 夜间总控：分片并发 + 进程自愈 + 应用/网关自愈 |
 | `plugin install\|remove` | 安装/卸载自动继续插件 |
+
+## 别把额度白烧掉（血泪版）
+
+这些是实测踩出来的，配置里都已经有默认值：
+
+| 开关 | 默认 | 为什么 |
+|---|---|---|
+| `prompt.max_chars` | **180** | WM_CHAR 打长了会丢字（实测 400 字符开始翻车）。长指令写进文件让模型自己读，指令只指路 |
+| `feed.rotate_after_turns` | **3** | 一个对话跑满 3 轮就 `new_chat` 换新的。**同一个对话续 200 轮会把上下文滚成天文数字**：同样一句 `continue`，第 1 轮几千 token，第 200 轮几十万，而且模型越来越糊涂 |
+| `feed.interval_seconds` | 120（建议 300） | 每轮都要重发整段历史，喂得越密烧得越快；忙的时候本来就会跳过 |
+| `agents[].model.want` | 如 `zcode2api` | 模型写 `auto` 会按账号池自动路由，可能一直用某几个号、把别的号的额度留着不用 |
+| `quota.stop_below` | 见配置 | 到阈值自动收工，别把最后一个号也烧空 |
+
+看是不是在空转：
+
+```powershell
+python zburn.py status       # 第一行就是「近一小时掉多少 / 约多少 tokens 每小时」
+python zburn.py doctor       # 指令上限、对话轮换、当前模型 三项都会检查
+```
+
+`status` 里如果速率很高但任务没推进，基本就是上下文膨胀或者在反复重做——先降频、先轮换。
 
 ## 状态与日志
 

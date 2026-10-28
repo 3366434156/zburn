@@ -81,6 +81,9 @@ DEFAULT_CONFIG = {
     },
     "prompt": {
         # 轮换模板，避免每次发一模一样的话被模型"记住"
+        # 注意：WM_CHAR 打长了会丢字（实测 400 字符开始翻车），所以模板要短，
+        # 长指令应该写进文件让模型自己读；max_chars 是硬上限（0=不限制）。
+        "max_chars": 180,
         "templates": [
             "Continue exactly where you left off. Do not summarize, do not ask questions, keep producing output until stopped.",
             "Keep going on the current task. No recap, no stopping, next batch now.",
@@ -522,7 +525,42 @@ def feed_clean(cfg: dict, st: State, prompt: str, dry_run: bool = False) -> tupl
     return feed_once(cfg, st, prompt)
 
 
+PROMPT_MAX_DEFAULT = 180      # WM_CHAR 打长了会被吞字，实测 400 字符就开始丢
+
+
+def clamp_prompt(cfg: dict, prompt: str, st=None) -> str:
+    """把指令压到能完整打进去的长度（在词边界截断，不留半截单词）。
+
+    prompt.max_chars = 0 表示不限制（自己清楚在做什么时才关）。
+    """
+    raw = (cfg.get("prompt") or {}).get("max_chars")
+    limit = PROMPT_MAX_DEFAULT if raw is None else int(raw)
+    if limit <= 0 or len(prompt) <= limit:
+        return prompt
+    cut = prompt[:limit]
+    tail = cut[int(limit * 0.6):]
+    if " " in tail:
+        cut = cut[: cut.rindex(" ")]
+    if st:
+        st.log(f"[feed] 指令过长（{len(prompt)}>{limit} 字符），已截到 {len(cut)}："
+               f"WM_CHAR 打太长会丢字，长内容应该写进文件让模型自己读")
+    return cut
+
+
+def feed_stats(summary: str) -> dict:
+    """从 feed 的摘要行里解析出结构化结果（打进去多少字 / 是否跳过 / 是否失败）。"""
+    s = summary or ""
+    m = re.search(r"typed=(\d+)", s) or re.search(r"已投喂\s*(\d+)\s*字符", s)
+    return {
+        "typed": int(m.group(1)) if m else None,
+        "busy": "busy=True" in s,
+        "fed": "已投喂" in s,
+        "failed": "失败" in s or "投喂失败" in s,
+    }
+
+
 def feed_once(cfg: dict, st: State, prompt: str, dry_run: bool = False) -> tuple[int, str]:
+    prompt = clamp_prompt(cfg, prompt, st)
     targets = feed_targets(cfg)
     regex = (cfg["uia"].get("session_regex") or "").strip()
     if not targets and not regex:
@@ -616,7 +654,7 @@ def scan_sessions(cfg: dict) -> tuple[list[dict], str]:
 
 def new_chat_once(cfg: dict, st: State, prompt: str, *, project: str = "",
                   dry_run: bool = False, click_only: bool = False,
-                  agent_id: str = "", clear_residual: bool = False) -> tuple[int, str]:
+                  agent_id: str = "", clear_residual: bool = False, force: bool = False) -> tuple[int, str]:
     """点「新建任务/新对话」→ 输入首条指令 → 提交。"""
     nc = cfg.get("new_chat") or {}
     if not nc.get("enabled", True):
@@ -641,6 +679,7 @@ def new_chat_once(cfg: dict, st: State, prompt: str, *, project: str = "",
         "ClickOnly": click_only,
         "ForceOffscreen": bool(nc.get("allow_offscreen", False)),
         "ClearResidual": clear_residual or bool(nc.get("clear_residual", False)),
+        "Force": bool(force),
     }
     code, out, err = run_ps("new-chat.ps1", params, timeout=600)
     lines = [ln for ln in (out or "").strip().splitlines() if ln.strip()]
@@ -848,9 +887,13 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
 
     ok_uia, why = uia_ok(acfg)
     if not ok_uia:
-        st.log(f"[{aid}] 无障碍树不可用（{why}）")
+        streak = int((agentlib.read_state(st, aid) or {}).get("uia_fail_streak") or 0) + 1
+        agentlib.update_state(st, aid, uia_fail_streak=streak)
+        st.log(f"[{aid}] 无障碍树不可用（{why}），连续第 {streak} 次")
+        # 只有连续 3 次（≈3 分钟）都读不到才重启应用：重启会打断正在生成的会话，
+        # 单次探测失败往往只是应用在忙 / 我们的探针撞在一起，不值得动手。
         if (IS_WIN and acfg["app"].get("start_if_down")
-                and acfg["app"].get("restart_on_uia_fail", True)):
+                and acfg["app"].get("restart_on_uia_fail", True) and streak >= 3):
             pname = acfg["app"]["process_name"]
             subprocess_hidden([pwsh(), "-NoProfile", "-Command",
                                f"Stop-Process -Name '{str(pname).replace(chr(39), chr(39) * 2)}' "
@@ -858,9 +901,11 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
             time.sleep(3)
             ok, why2 = start_app(acfg)
             st.log(f"[{aid}] 重启应用：{'成功' if ok else '失败'} {why2}")
+            agentlib.update_state(st, aid, uia_fail_streak=0)
             time.sleep(15)
         agentlib.update_state(st, aid, last_run=now(), last_result=f"uia: {why}")
         return 1, f"uia: {why}"
+    agentlib.update_state(st, aid, uia_fail_streak=0)
 
     # 1) 有交接：优先执行；新对话在 busy 时保留到下一轮
     pending = agentlib.get_pending(st, aid)
@@ -894,12 +939,39 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
             st.log(f"[{aid}] 监督会话没配置：在 agents 里给 {aid} 设 feed.targets（dsh 里那个监督对话的标题）")
         return (0 if code in (0, 3) else 1), summary
 
-    # 3) worker：普通续派
+    # 3) worker：普通续派（跑够轮数就换新对话，别把上下文喂成天文数字）
+    rotate_after = int(acfg["feed"].get("rotate_after_turns") or 0)
+    stt = agentlib.read_state(st, aid) or {}
+    turns = int(stt.get("turns_on_target") or 0)
+    if rotate_after > 0 and turns >= rotate_after:
+        seed = pathlib.Path(acfg["prompt"].get("file") or "next-prompt.txt")
+        if not seed.is_absolute():
+            seed = st.dir / seed
+        text = ""
+        try:
+            text = seed.read_text(encoding="utf-8").strip().splitlines()[0]
+        except OSError:
+            pass
+        text = clamp_prompt(acfg, text or "continue", st)
+        code, summary = new_chat_once(acfg, st, text,
+                                      project=acfg["new_chat"].get("project", ""),
+                                      agent_id=aid, force=True)
+        st.log(f"[{aid}] 已跑满 {turns} 轮 → 换新对话（{summary}）")
+        agentlib.update_state(st, aid, turns_on_target=0, last_run=now(),
+                              last_action="new_chat", last_result=summary,
+                              last_feed=now() if code == 0 else "")
+        return (0 if code == 0 else 1), summary
+
     prompt = build_prompt(acfg, st, cycle, remaining)
     code, summary = feed_clean(acfg, st, prompt, dry_run=dry_run)
     st.log(f"[{aid}] 第 {cycle} 轮投喂：{summary}")
+    stats = feed_stats(summary)
+    fed = code == 0 and not stats["failed"] and not stats["busy"]
     agentlib.update_state(st, aid, last_run=now(), last_action="feed",
-                          last_result=summary, last_feed=now() if code == 0 else "")
+                          last_result=summary,
+                          last_typed=stats["typed"],
+                          turns_on_target=(turns + 1) if fed else turns,
+                          last_feed=now() if fed else "")
     if code == 3:
         st.log(f"[{aid}] 未指定监控对话：面板「会话监控」勾选或配置 feed.targets 后下一轮开始")
     return (0 if code in (0, 3) else 1), summary
@@ -1056,6 +1128,25 @@ def cmd_doctor(a) -> int:
     ascii_bad = [t for t in tpls if any(ord(c) > 126 for c in t)]
     print(f"[{'OK ' if not ascii_bad else 'WARN'}] 提示模板 {len(tpls)} 条"
           + ("" if not ascii_bad else "，含非 ASCII 会被丢弃（WM_CHAR 限制）"))
+    long_tpl = [t for t in tpls if len(t) > 240]
+    lim = (cfg.get("prompt") or {}).get("max_chars")
+    print(f"[{'OK ' if not long_tpl and (lim is None or int(lim) == 0 or int(lim) <= 240) else 'WARN'}] "
+          f"指令上限 {lim if lim is not None else PROMPT_MAX_DEFAULT} 字符"
+          + ("（太长会丢字，长内容请写进文件让模型读）" if long_tpl else ""))
+    rot = int(cfg["feed"].get("rotate_after_turns") or 0)
+    print(f"[{'OK ' if rot else 'WARN'}] 对话轮换："
+          + (f"每个对话跑满 {rot} 轮就换新对话" if rot else "未开启（长时间续同一个对话会让上下文越滚越大、白烧额度）"))
+    if ok_app:
+        cur = probe_model(cfg)
+        want = ""
+        for spec in agentlib.agent_specs(cfg):
+            if (spec.get("model") or {}).get("want"):
+                want = spec["model"]["want"]
+                break
+        if cur:
+            bad = bool(want) and want not in cur
+            print(f"[{'WARN' if bad else 'OK '}] 当前模型：{cur}"
+                  + (f"（期望含 '{want}'，用 zburn model --set 切换，需解锁桌面）" if bad else ""))
     print(f"[OK ] 脚本目录: {SCRIPTS}（{len(list(SCRIPTS.glob('*.ps1')))} 个 ps1）")
     return 0 if ok_app else 1
 
@@ -1069,9 +1160,39 @@ def cmd_quota(a) -> int:
     return 0 if remaining is not None else 1
 
 
+def quota_rate(st: State, minutes: int = 60) -> tuple[float | None, int | None]:
+    """最近 N 分钟的额度消耗速率（tokens/小时）与窗口内的降幅。"""
+    try:
+        rows = [ln.split(",") for ln in
+                st.quota_csv.read_text(encoding="utf-8-sig").splitlines()[1:] if ln.strip()]
+    except OSError:
+        return None, None
+    pts: list[tuple[float, int]] = []
+    for r in rows:
+        if len(r) < 2 or not r[1].strip().isdigit():
+            continue
+        try:
+            ts = dt.datetime.strptime(r[0].strip(), "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            continue
+        pts.append((ts, int(r[1])))
+    if len(pts) < 2:
+        return None, None
+    now = time.time()
+    win = [p for p in pts if now - p[0] <= minutes * 60] or pts[-2:]
+    (t0, v0), (t1, v1) = win[0], win[-1]
+    drop = v0 - v1
+    hours = max((t1 - t0) / 3600, 1e-6)
+    return drop / hours, drop
+
+
 def cmd_status(a) -> int:
     cfg = load_config(a.config)
     st = State(cfg)
+    rate, drop = quota_rate(st)
+    if rate is not None:
+        print(f"额度速率: 近一小时掉 {drop:,}，约 {int(rate):,} tokens/小时"
+              + ("  ← 没有产出还这么烧就说明在空转" if rate > 5_000_000 else ""))
     if st.status_path.exists():
         print(json.dumps(json.loads(st.status_path.read_text(encoding="utf-8")), ensure_ascii=False, indent=1))
     else:
@@ -1477,7 +1598,8 @@ def cmd_newchat(a) -> int:
     code, summary = new_chat_once(acfg, st, prompt,
                                   project=a.project or acfg["new_chat"].get("project", ""),
                                   dry_run=a.dry_run, click_only=a.click_only,
-                                  agent_id=spec["id"], clear_residual=a.clear_residual)
+                                  agent_id=spec["id"], clear_residual=a.clear_residual,
+                                  force=bool(getattr(a, "force", False)))
     st.log(f"[{spec['id']}] 新建对话（dry-run={a.dry_run}）：{summary}")
     st.status(last_new_chat=now(), last_new_chat_summary=summary)
     print(summary)
@@ -1602,6 +1724,48 @@ def cmd_autopilot(a) -> int:
                          poll=a.poll, max_hours=a.hours)
 
 
+def probe_model(cfg: dict) -> str:
+    """读当前对话的模型名（输入框旁那个按钮的文案）。只读。"""
+    try:
+        code, out, err = run_ps("probe-model.ps1",
+                                {"ProcessName": cfg["app"]["process_name"]}, timeout=90)
+    except Exception:
+        return ""
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    return lines[0] if lines else ""
+
+
+def cmd_model(a) -> int:
+    """看/校验/切换当前对话的模型（钉死模型，别让 auto 白烧额度）。"""
+    cfg = load_config(a.config)
+    st = State(cfg)
+    spec = agentlib.find_agent(cfg, getattr(a, "agent", None)) or agentlib.agent_specs(cfg)[0]
+    acfg = agentlib.agent_view(cfg, spec, st)
+    want = (a.want or (acfg.get("model") or {}).get("want") or "").strip()
+    cur = probe_model(acfg)
+    print(f"{spec['id']}: {cur or '(读不到模型按钮)'}")
+    if a.set:
+        if not want:
+            print("要用 --set 得先给 --want（例如 --want zcode2api）")
+            return 2
+        code, out, err = run_ps("pick-model2.ps1",
+                                {"ProcessName": acfg["app"]["process_name"], "Wanted": want},
+                                timeout=180)
+        for ln in (out or "").splitlines()[-4:]:
+            print("  " + ln.strip())
+        if code != 0:
+            print("切换失败（锁屏下列表项点不动）：解锁桌面后重跑，或在应用里手选一次")
+        cur = probe_model(acfg)
+        print(f"切换后：{cur or '(读不到)'}")
+    if want and want not in cur:
+        print(f"✗ 模型不符合预期：要含 '{want}'，实际 '{cur}'")
+        return 2
+    if want:
+        print(f"✓ 模型符合预期（含 '{want}'）")
+    agentlib.update_state(st, spec["id"], last_model=cur)
+    return 0
+
+
 def cmd_panel_token(a) -> int:
     """生成一个随机 token（面板鉴权用）。"""
     import secrets
@@ -1659,6 +1823,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--click-only", action="store_true", help="只点开新对话，不输入")
     p.add_argument("--clear-residual", action="store_true",
                    help="输入框有残留时用 SetValue 清空（只在你确认那是自己的草稿时用）")
+    p.add_argument("--force", action="store_true", help="当前会话正在生成也照样新建对话")
     p.set_defaults(func=cmd_newchat)
 
     p = sub.add_parser("handoff", help="写/看/执行监督交接")
@@ -1732,6 +1897,13 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("token", help="生成面板 token").set_defaults(func=cmd_panel_token)
 
+    mp = sub.add_parser("model", help="看/校验/切换当前对话的模型")
+    mp.add_argument("--config", default=__import__("argparse").SUPPRESS)
+    mp.add_argument("--agent", default=None, help="目标 agent（默认 worker）")
+    mp.add_argument("--want", default=None, help="期望模型名里包含的字样（如 zcode2api）")
+    mp.add_argument("--set", action="store_true", help="尝试切换（需要解锁桌面）")
+    mp.set_defaults(func=cmd_model)
+
     rp = sub.add_parser("restart-app", help="带无障碍开关重启目标应用（修 a11y 树为空）")
     rp.add_argument("--config", default=__import__("argparse").SUPPRESS)
     rp.add_argument("--agent", default=None, help="要重启哪个 agent（默认第一个）")
@@ -1749,3 +1921,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

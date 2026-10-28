@@ -210,6 +210,40 @@ if (-not $pickVisible -and -not $ForceOffscreen) {
             $pickVisible = ($pick.Y + $pick.H -gt $winY + 4) -and ($pick.Y -lt $winY + $winH - 4)
         } catch { }
     }
+    # ScrollItemPattern 在 Chromium 虚拟列表上常常不认（项目行不在可滚动区里）。
+    # 退一步：从按钮往上找支持 ScrollPattern 的祖先，按大格往下滚几次再看是否进视口。
+    # 失败就照旧 exit 2 —— 这段只可能把「点不到」变成「点到」，不引入新行为。
+    for ($s = 0; $s -lt 12 -and -not $pickVisible; $s++) {
+        $moved = $false
+        try {
+            $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+            $node = $pick.El
+            for ($d = 0; $d -lt 8 -and $node; $d++) {
+                $node = $walker.GetParent($node)
+                if (-not $node) { break }
+                $sp = $null
+                if ($node.TryGetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern, [ref]$sp)) {
+                    if ($sp.Current.VerticallyScrollable) {
+                        $sp.Scroll([System.Windows.Automation.ScrollAmount]::NoAmount,
+                                   [System.Windows.Automation.ScrollAmount]::LargeIncrement)
+                        $moved = $true
+                        break
+                    }
+                }
+            }
+        } catch { }
+        if (-not $moved) { break }
+        Start-Sleep -Milliseconds 350
+        try {
+            $r2 = $pick.El.Current.BoundingRectangle
+            $pick.X = [double]$r2.X; $pick.Y = [double]$r2.Y
+            $pick.W = [double]$r2.Width; $pick.H = [double]$r2.Height
+            $pickVisible = ($pick.Y + $pick.H -gt $winY + 4) -and ($pick.Y -lt $winY + $winH - 4)
+        } catch { break }
+    }
+    if ($pickVisible) {
+        Write-Output ("已用侧栏滚动把新建按钮滚进可视区域（y={0}）" -f [int]$pick.Y)
+    }
     if (-not $pickVisible) {
         $msg = ("新建按钮不在可视区域（y={0}，窗口 {1}..{2}）。" +
             "请先把侧栏滚到项目 /{3}/；确认要硬点可加 -ForceOffscreen")
@@ -283,9 +317,9 @@ if ($clean.Length -eq 0) {
     exit 4
 }
 
-# 新会话渲染有延迟（多项目/多会话时更慢），最多等 12 秒
+# 新会话渲染有延迟（多项目/多会话时更慢，画廊页 25MB 时更难建），最多等 28 秒
 $composer = $null
-for ($i = 0; $i -lt 12 -and -not $composer; $i++) {
+for ($i = 0; $i -lt 40 -and -not $composer; $i++) {
     Start-Sleep -Milliseconds 700
     $composer = Find-Composer (Get-Controls)
 }
@@ -329,7 +363,7 @@ if ($current.Length -gt 0) {
             $send0 = Get-Controls | Where-Object {
                     $_.Type -eq 'ControlType.Button' -and $_.Name -match $SendButtonRegex -and
                     $_.Name -notmatch $ExcludeButtonRegex
-                } | Sort-Object X -Descending | Select-Object -First 1
+                } | Sort-Object { [Math]::Abs($_.X - ($composer.X + $composer.W)) + [Math]::Abs($_.Y - $composer.Y) } | Select-Object -First 1
             if ($send0) {
                 try {
                     $send0.El.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
@@ -384,7 +418,7 @@ if ($final -ne $clean) {
 $send = Get-Controls | Where-Object {
         $_.Type -eq 'ControlType.Button' -and $_.Name -match $SendButtonRegex -and
         $_.Name -notmatch $ExcludeButtonRegex
-    } | Sort-Object X -Descending | Select-Object -First 1
+    } | Sort-Object { [Math]::Abs($_.X - ($composer.X + $composer.W)) + [Math]::Abs($_.Y - $composer.Y) } | Select-Object -First 1
 $submitted = $false
 if ($send) {
     try {

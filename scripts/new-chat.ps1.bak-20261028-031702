@@ -1,0 +1,408 @@
+# 新建对话并投递第一条指令（UIA + WM_CHAR，不抢焦点，锁屏可用）
+#
+# 和 inject-uia.ps1 的区别：先点目标应用里的「新建任务 / 新建对话」按钮，
+# 等新会话的输入框出现，再输入并提交。用于「任务做完后换一个新对话」，
+# 避免一直在一个超长上下文里续命。
+#
+# 用法：
+#   pwsh -File new-chat.ps1 -Text "New task: ..." -ProjectName zburn
+#   pwsh -File new-chat.ps1 -Text "..." -ProcessName ZCode -NewChatButtonRegex '新建任务|新对话'
+#   pwsh -File new-chat.ps1 -Text "..." -DryRun          # 只定位按钮/输入框
+#   pwsh -File new-chat.ps1 -ClickOnly                   # 只点开新对话，不输入
+#
+# 退出码：0 成功 / 1 没窗口 / 2 没找到新建按钮 / 3 没找到输入框 /
+#         4 投递不完整 / 5 未提交 / 6 当前会话正在生成 / 7 输入框里有残留
+param(
+    [string]$Text = '',
+    [string]$ProcessName = 'ZCode',
+    [string]$WindowTitleRegex = '',
+    [string]$NewChatButtonRegex = '新建任务|新建对话|新对话|新聊天|新建会话|New chat|New task|New conversation',
+    [string]$ProjectName = '',
+    [string]$SendButtonRegex = '发送|加入队列|立即|Send',
+    [string]$ExcludeButtonRegex = '移除待发送消息|停止生成|Remove queued|Stop generating',
+    [string]$BusyRegex = '停止生成|Stop generating',
+    [string]$QueuedRegex = '移除待发送消息|Remove queued',
+    [switch]$Force,
+    [switch]$ClickOnly,
+    [switch]$DryRun,
+    [switch]$ForceOffscreen,
+    [switch]$ClearResidual,
+    [double]$ComposerMinWidthRatio = 0.40,
+    [int]$CharDelayMs = 25,
+    [int]$MaxDepth = 40
+)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -Namespace Zburn -Name NewChatNative -MemberDefinition @"
+[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+"@
+Add-Type -Namespace Zburn -Name NewChatWin -MemberDefinition @"
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
+public delegate bool EnumProc(IntPtr h, IntPtr lp);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int max);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+"@
+
+$WM_CHAR = 0x0102
+$AT = [System.Windows.Automation.AutomationElement]
+$walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+
+function Find-TargetWindow {
+    param([string]$ProcName, [string]$TitleRegex)
+    if ($TitleRegex) {
+        $procIds = @(Get-Process -Name $ProcName -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
+        if ($procIds.Count -eq 0) { return $null }
+        $wins = New-Object System.Collections.ArrayList
+        $cb = [Zburn.NewChatWin+EnumProc] {
+            param($h, $lp)
+            try {
+                if (-not [Zburn.NewChatWin]::IsWindowVisible($h)) { return $true }
+                [uint32]$wpid = 0
+                [void][Zburn.NewChatWin]::GetWindowThreadProcessId($h, [ref]$wpid)
+                if ($procIds -contains [int]$wpid) {
+                    $sb = New-Object System.Text.StringBuilder 512
+                    [void][Zburn.NewChatWin]::GetWindowText($h, $sb, 512)
+                    if ($sb.Length -gt 0) { [void]$wins.Add([pscustomobject]@{ H = $h; Title = $sb.ToString() }) }
+                }
+            } catch { }
+            return $true
+        }
+        [void][Zburn.NewChatWin]::EnumWindows($cb, [IntPtr]::Zero)
+        return @($wins | Where-Object { $_.Title -match $TitleRegex } | Select-Object -First 1)
+    }
+    $proc = Get-Process -Name $ProcName -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | Select-Object -First 1
+    if (-not $proc) { return $null }
+    return [pscustomobject]@{ H = $proc.MainWindowHandle; Title = $proc.MainWindowTitle }
+}
+
+$win = Find-TargetWindow -ProcName $ProcessName -TitleRegex $WindowTitleRegex
+if (-not $win) {
+    if ($WindowTitleRegex) { [Console]::Error.WriteLine("没有标题匹配 /$WindowTitleRegex/ 的 $ProcessName 窗口") }
+    else { [Console]::Error.WriteLine("未找到 $ProcessName 主窗口（进程在跑但没窗口？）") }
+    exit 1
+}
+$top = $win.H
+$root = $AT::FromHandle($top)
+
+function Get-Controls {
+    $acc = New-Object System.Collections.ArrayList
+    function Walk($el, $d) {
+        if ($d -gt $MaxDepth) { return }
+        try {
+            $ct = $el.Current.ControlType
+            $r = $el.Current.BoundingRectangle
+            [void]$acc.Add([pscustomobject]@{
+                El = $el; Type = $ct.ProgrammaticName; Name = $el.Current.Name
+                X = [double]$r.X; Y = [double]$r.Y; W = [double]$r.Width; H = [double]$r.Height
+                Enabled = [bool]$el.Current.IsEnabled
+            })
+        } catch { return }
+        try { $c = $walker.GetFirstChild($el) } catch { return }
+        while ($c) {
+            Walk $c ($d + 1)
+            try { $c = $walker.GetNextSibling($c) } catch { break }
+        }
+    }
+    Walk $root 0
+    return $acc
+}
+
+function Find-Composer($items) {
+    $best = $null; $bestArea = 0
+    # 聊天输入框通常横跨大半个主区；ZCode 右侧常开内置浏览器，页面里的
+    # textarea 也在无障碍树里，必须用宽度把「聊天输入框」和「网页输入框」分开。
+    $minW = [Math]::Max(120, $winW * $ComposerMinWidthRatio)
+    foreach ($c in $items) {
+        if ($c.Type -ne 'ControlType.Edit' -or $c.W -lt $minW -or $c.H -lt 20) { continue }
+        $area = $c.W * $c.H
+        if ($area -gt $bestArea) { $bestArea = $area; $best = $c }
+    }
+    return $best
+}
+
+$items = Get-Controls
+$winCtl = @($items | Where-Object { $_.Type -eq 'ControlType.Window' -and $_.W -gt 600 } |
+    Select-Object -First 1)
+if ($winCtl) { $winX = [double]$winCtl.X; $winW = [double]$winCtl.W }
+else { $winX = 0; $winW = 1920 }
+$sideLimit = $winX + $winW * 0.35      # 侧栏/项目树的上限；正文在右侧，不能混进来
+
+$cands = @($items | Where-Object {
+        $_.Type -eq 'ControlType.Button' -and $_.Enabled -and $_.Name -and
+        $_.Name -match $NewChatButtonRegex -and $_.W -gt 0 -and $_.H -gt 0
+    })
+if ($cands.Count -eq 0) {
+    $near = @($items | Where-Object {
+            $_.Type -eq 'ControlType.Button' -and $_.Name -match '新建|新对话|New' -and $_.W -gt 0
+        } | Select-Object -First 12 | ForEach-Object { $_.Name })
+    [Console]::Error.WriteLine(("没找到新建对话按钮（正则 /{0}/）。候选：{1}" -f
+            $NewChatButtonRegex, (($near | Select-Object -Unique) -join ' | ')))
+    exit 2
+}
+
+$proj = $null
+$pick = $null
+if ($ProjectName) {
+    # 项目行：侧栏里的 Button（ZCode 的项目名就是一个宽按钮，不是 ListItem）。
+    # 只认按钮 + 只认侧栏区域，避免把正文里同名文字当成项目。
+    $projCands = @($items | Where-Object {
+            $_.Type -eq 'ControlType.Button' -and $_.Name -match $ProjectName -and
+            $_.X -lt $sideLimit -and $_.W -gt 50 -and $_.H -gt 20
+        } | Sort-Object Y)
+    $exact = @($projCands | Where-Object { $_.Name -eq $ProjectName })
+    if ($exact.Count -gt 0) { $proj = $exact[0] }
+    elseif ($projCands.Count -gt 0) { $proj = $projCands[0] }
+    if ($proj) {
+        $near = @($cands | Where-Object {
+                $_.Y -ge ($proj.Y - 12) -and $_.Y -le ($proj.Y + $proj.H + 12) -and
+                $_.X -ge $proj.X
+            } | Sort-Object X)
+        if ($near.Count -gt 0) { $pick = $near[0] }
+        if (-not $pick) {
+            # 有些应用把「新建」放在项目行内部或右侧；按纵向距离兜底
+            $pick = @($cands | Sort-Object { [Math]::Abs($_.Y - $proj.Y) } | Select-Object -First 1)
+        }
+    } else {
+        [Console]::Error.WriteLine("没找到项目 /$ProjectName/（侧栏按钮），将退回第一个新建按钮")
+    }
+}
+if (-not $pick) {
+    $pick = @($cands | Where-Object { $_.X -lt $sideLimit } | Sort-Object Y, X | Select-Object -First 1)
+}
+if (-not $pick) {
+    $pick = @($cands | Sort-Object Y, X | Select-Object -First 1)
+}
+if (-not $pick) {
+    [Console]::Error.WriteLine("没找到可点击的新建对话按钮")
+    exit 2
+}
+
+# 按钮在侧栏滚动区外面时，Invoke 可能点不动；更危险的是点不动后把字打进当前对话。
+# 默认拒绝，要求先把项目滚进可视区域；-ForceOffscreen 只给排障用。
+$winY = if ($winCtl) { [double]$winCtl.Y } else { 0 }
+$winH = if ($winCtl) { [double]$winCtl.H } else { 1080 }
+$pickVisible = ($pick.Y + $pick.H -gt $winY + 4) -and ($pick.Y -lt $winY + $winH - 4)
+if (-not $pickVisible -and -not $ForceOffscreen) {
+    # 先试着把项目行滚进可视区域（Chromium 对虚拟列表通常提供 ScrollItemPattern）
+    $scrolled = $false
+    foreach ($el in @($proj, $pick)) {
+        if (-not $el) { continue }
+        try {
+            $el.El.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern).ScrollIntoView()
+            $scrolled = $true
+            break
+        } catch { }
+    }
+    if ($scrolled) {
+        Start-Sleep -Milliseconds 700
+        try {
+            $r = $pick.El.Current.BoundingRectangle
+            $pick.X = [double]$r.X; $pick.Y = [double]$r.Y
+            $pick.W = [double]$r.Width; $pick.H = [double]$r.Height
+            if ($proj) {
+                $rp = $proj.El.Current.BoundingRectangle
+                $proj.X = [double]$rp.X; $proj.Y = [double]$rp.Y
+                $proj.W = [double]$rp.Width; $proj.H = [double]$rp.Height
+            }
+            $pickVisible = ($pick.Y + $pick.H -gt $winY + 4) -and ($pick.Y -lt $winY + $winH - 4)
+        } catch { }
+    }
+    if (-not $pickVisible) {
+        $msg = ("新建按钮不在可视区域（y={0}，窗口 {1}..{2}）。" +
+            "请先把侧栏滚到项目 /{3}/；确认要硬点可加 -ForceOffscreen")
+        [Console]::Error.WriteLine(($msg -f [int]$pick.Y, [int]$winY,
+            [int]($winY + $winH), $ProjectName))
+        exit 2
+    }
+    Write-Output ("已把项目 /{0}/ 滚入可视区域（y={1}）" -f $ProjectName, [int]$pick.Y)
+}
+if (-not $pickVisible) {
+    Write-Output ("警告：新建按钮不可见（y={0}），按 -ForceOffscreen 继续" -f [int]$pick.Y)
+}
+
+$composer0 = Find-Composer $items
+if ($DryRun) {
+    $projTxt = if ($proj) { "{0}@({1},{2})" -f $proj.Name, [int]$proj.X, [int]$proj.Y } else { '<none>' }
+    $compTxt = if ($composer0) { "({0},{1} {2}x{3})" -f [int]$composer0.X, [int]$composer0.Y, [int]$composer0.W, [int]$composer0.H } else { '<none>' }
+    $curTxt = ''
+    if ($composer0) {
+        try {
+            $cv = $composer0.El.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value
+            $curTxt = " len=" + $cv.Length + " preview='" + ($cv -replace "[`r`n]+", ' ').Substring(0, [Math]::Min(60, ($cv -replace "[`r`n]+", ' ').Length)) + "'"
+        } catch { }
+    }
+    Write-Output ("dry-run newChat='{0}' at ({1},{2} {3}x{4}) project={5} composer={6}{7}" -f
+        $pick.Name, [int]$pick.X, [int]$pick.Y, [int]$pick.W, [int]$pick.H, $projTxt, $compTxt, $curTxt)
+    exit 0
+}
+
+# 当前正在生成/排队时不点新对话：避免和正在跑的回合抢输入区。
+$busy = @($items | Where-Object { $_.Type -eq 'ControlType.Button' -and $_.Name -match $BusyRegex }).Count -gt 0
+$queued = @($items | Where-Object { $_.Type -eq 'ControlType.Button' -and $_.Name -match $QueuedRegex }).Count -gt 0
+if (($busy -or $queued) -and -not $Force) {
+    [Console]::Error.WriteLine(("当前会话 busy={0} queued={1}，不新建对话（要强制加 -Force）" -f $busy, $queued))
+    exit 6
+}
+
+try {
+    $pick.El.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+} catch {
+    [Console]::Error.WriteLine("点击新建对话按钮失败：$($_.Exception.Message)")
+    exit 2
+}
+Start-Sleep -Milliseconds 2500
+
+if ($ClickOnly) {
+    $comp = $null
+    for ($i = 0; $i -lt 10 -and -not $comp; $i++) {
+        Start-Sleep -Milliseconds 500
+        $comp = Find-Composer (Get-Controls)
+    }
+    if ($comp) {
+        $cvTxt = ''
+        try {
+            $cv = $comp.El.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value
+            $one = $cv -replace "[`r`n]+", ' '
+            $cvTxt = " len=" + $cv.Length + " preview='" + $one.Substring(0, [Math]::Min(60, $one.Length)) + "'"
+        } catch { }
+        Write-Output ("clicked newChat='{0}' composer=({1},{2} {3}x{4}){5}" -f
+            $pick.Name, [int]$comp.X, [int]$comp.Y, [int]$comp.W, [int]$comp.H, $cvTxt)
+    } else {
+        Write-Output ("clicked newChat='{0}' composer=<none>" -f $pick.Name)
+    }
+    exit 0
+}
+
+$clean = (($Text -replace "[`r`n]+", ' ').ToCharArray() |
+    Where-Object { [int][char]$_ -ge 32 -and [int][char]$_ -le 126 }) -join ''
+if ($clean.Length -eq 0) {
+    [Console]::Error.WriteLine('文本里没有可投递的 ASCII 字符')
+    exit 4
+}
+
+# 新会话渲染有延迟（多项目/多会话时更慢），最多等 12 秒
+$composer = $null
+for ($i = 0; $i -lt 12 -and -not $composer; $i++) {
+    Start-Sleep -Milliseconds 700
+    $composer = Find-Composer (Get-Controls)
+}
+if (-not $composer) {
+    [Console]::Error.WriteLine('点了新建对话但没等到输入框')
+    exit 3
+}
+try { $composer.El.SetFocus() } catch { }
+$value = $composer.El.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+$readText = {
+    try { ($value.Current.Value -replace "[`r`n]+$", '') } catch { '' }
+}
+
+# 先等视图稳定（连续 3 次读数不变）再判断；默认绝不自动清空——框里可能是
+# 另一个 agent/任务正在用的草稿。只有确认是自己的草稿时才加 -ClearResidual。
+$lastVal = $null; $stable = 0
+for ($i = 0; $i -lt 16; $i++) {
+    Start-Sleep -Milliseconds 400
+    $now = & $readText
+    if ($now -eq $lastVal) { $stable++ } else { $stable = 0 }
+    $lastVal = $now
+    if ($stable -ge 3) { break }
+}
+
+$current = & $readText
+if ($current.Length -gt 0) {
+    if ($clean.StartsWith($current)) {
+        Write-Output ("接续：输入框已有 {0} 字，补剩余 {1} 字" -f $current.Length,
+            ($clean.Length - $current.Length))
+    } elseif ($ClearResidual) {
+        $oldLen = $current.Length
+        try {
+            $value.SetValue('')
+            Start-Sleep -Milliseconds 350
+            $current = & $readText
+        } catch { }
+        if ($current.Length -gt 0) {
+            # ZCode 2.x 上 SetValue/退格/Ctrl+A 全是空操作，唯一可靠的腾空办法：
+            # 把它当一条普通消息发出去（Invoke 发送按钮），输入框随即清空。
+            $residue = $current
+            $send0 = Get-Controls | Where-Object {
+                    $_.Type -eq 'ControlType.Button' -and $_.Name -match $SendButtonRegex -and
+                    $_.Name -notmatch $ExcludeButtonRegex
+                } | Sort-Object { [Math]::Abs($_.X - ($composer.X + $composer.W)) + [Math]::Abs($_.Y - $composer.Y) } | Select-Object -First 1
+            if ($send0) {
+                try {
+                    $send0.El.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+                    for ($k = 0; $k -lt 10; $k++) {
+                        Start-Sleep -Milliseconds 400
+                        $current = & $readText
+                        if ($current.Length -eq 0) { break }
+                    }
+                } catch { }
+            }
+            if ($current.Length -eq 0) {
+                Write-Output ("已把残留当消息发出、输入框腾空（原 {0} 字，'…{1}'）" -f $oldLen,
+                    $residue.Substring([Math]::Max(0, $residue.Length - 20)))
+            } else {
+                $preview = $current.Substring(0, [Math]::Min(60, $current.Length))
+                [Console]::Error.WriteLine("新会话输入框里有残留（" + $current.Length + " 字），SetValue 清不掉、发送也没腾空：'" + $preview + "'")
+                exit 7
+            }
+        }
+        if ($current.Length -eq 0 -and $oldLen -gt 0) {
+            Write-Output ("新会话输入框已腾空（原 {0} 字）" -f $oldLen)
+        }
+    } else {
+        $preview = $current.Substring(0, [Math]::Min(60, $current.Length))
+        [Console]::Error.WriteLine("新会话输入框里有残留（" + $current.Length + " 字），不是本指令的前缀：'" + $preview + "'；确认是自己的草稿可加 -ClearResidual")
+        exit 7
+    }
+}
+
+for ($attempt = 0; $attempt -lt 6; $attempt++) {
+    $now = & $readText
+    if ($now -eq $clean) { break }
+    if (-not $clean.StartsWith($now)) {
+        [Console]::Error.WriteLine("内容被外部改动，放弃本次投递")
+        exit 7
+    }
+    $suffix = $clean.Substring($now.Length)
+    for ($i = 0; $i -lt $suffix.Length; $i++) {
+        [void][Zburn.NewChatNative]::PostMessage($top, $WM_CHAR, [IntPtr][int][char]$suffix[$i], [IntPtr]1)
+        Start-Sleep -Milliseconds $CharDelayMs
+        if (($i + 1) % 6 -eq 0) { Start-Sleep -Milliseconds 80 }
+    }
+    Start-Sleep -Milliseconds 450
+}
+
+$final = & $readText
+if ($final -ne $clean) {
+    [Console]::Error.WriteLine("投递不完整 typed={0} target={1}" -f $final.Length, $clean.Length)
+    exit 4
+}
+
+$send = Get-Controls | Where-Object {
+        $_.Type -eq 'ControlType.Button' -and $_.Name -match $SendButtonRegex -and
+        $_.Name -notmatch $ExcludeButtonRegex
+    } | Sort-Object { [Math]::Abs($_.X - ($composer.X + $composer.W)) + [Math]::Abs($_.Y - $composer.Y) } | Select-Object -First 1
+$submitted = $false
+if ($send) {
+    try {
+        $send.El.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+        Start-Sleep -Milliseconds 800
+        $submitted = ((& $readText).Length -eq 0)
+    } catch { }
+}
+if (-not $submitted) {
+    [void][Zburn.NewChatNative]::PostMessage($top, 0x0100, [IntPtr]0x0D, [IntPtr]0x001C0001)
+    Start-Sleep -Milliseconds 80
+    [void][Zburn.NewChatNative]::PostMessage($top, 0x0101, [IntPtr]0x0D, [IntPtr]0xC01C0001)
+    Start-Sleep -Milliseconds 700
+    $submitted = ((& $readText).Length -eq 0)
+}
+
+$btn = if ($send) { $send.Name } else { '<none>' }
+Write-Output ("new-chat project='{0}' button='{1}' typed={2} submitted={3} send='{4}'" -f
+    $ProjectName, $pick.Name, $clean.Length, $submitted, $btn)
+if (-not $submitted) { exit 5 }
+
