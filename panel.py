@@ -362,6 +362,9 @@ def collect(cfg: dict, st, sup: Supervisor, tail: int = 120,
             # 别用 zburn.config_source()：`python zburn.py panel` 时 zburn 是被当
             # __main__ 跑的，这里 import 出来的是另一个模块实例，全局变量是空的。
             "config_source": config_path or "<内置默认>",
+            "window": zburn.window_desc(cfg),
+            "in_window": zburn.in_window(cfg),
+            "stop_action": str(cfg["quota"].get("stop_action") or "exit"),
             "stop_below": cfg["quota"]["stop_below"],
             "providers": cfg["quota"]["provider"],
             "prompt_file": cfg["prompt"].get("file"),

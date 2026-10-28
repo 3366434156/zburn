@@ -107,9 +107,13 @@ DEFAULT_CONFIG = {
         "refresh_body": {"all": True},
         "refresh_every_seconds": 600,
         "stop_below": 0,
+        # 额度低于阈值时怎么办：exit=收工（默认）｜wait=原地等额度回来
+        "stop_action": "exit",
         "command": "",
     },
     "paths": {"state_dir": ".zburn", "stop_file": "STOP", "bridge_dir": ""},
+    # 只在这个时段干活（跨午夜也认：23:00-09:00）。没开=全天。
+    "window": {"enabled": False, "start": "23:00", "end": "09:00"},
     "watchdog": {"heartbeat_stale_seconds": 420, "check_seconds": 30},
     "panel": {"host": "127.0.0.1", "port": 8790, "token": "", "autostart": False},
     # 多 agent：空列表 = 沿用上面 app/uia/feed/prompt 的单应用行为。
@@ -482,6 +486,63 @@ def _sum_remaining(obj) -> int | None:
 
     walk(obj)
     return total
+
+
+# ---------------------------------------------------------------- 允许时段
+def _hhmm_minutes(text, default: int) -> int:
+    """'23:00' → 1380。写错就退回默认值（宁可跑错时段，也别因为一行配置不干活）。"""
+    m = re.match(r"^\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*$", str(text or ""))
+    if not m:
+        return default
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 24 and 0 <= mi < 60):
+        return default
+    return (h % 24) * 60 + mi
+
+
+def window_spec(cfg: dict) -> tuple[int, int] | None:
+    """(开始分钟, 结束分钟)；没开或写错返回 None（= 不限时段）。"""
+    w = cfg.get("window") or {}
+    if not w.get("enabled"):
+        return None
+    return (_hhmm_minutes(w.get("start"), 23 * 60),
+            _hhmm_minutes(w.get("end"), 9 * 60))
+
+
+def in_window(cfg: dict, when: dt.datetime | None = None) -> bool:
+    """现在是不是允许干活的时间。支持跨午夜（23:00-09:00）。"""
+    spec = window_spec(cfg)
+    if spec is None:
+        return True
+    start, end = spec
+    if start == end:
+        return True
+    t = when or dt.datetime.now()
+    cur = t.hour * 60 + t.minute
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end
+
+
+def seconds_until_window(cfg: dict, when: dt.datetime | None = None) -> int:
+    """离下一次进入时段还有多少秒；已经在时段里就是 0。"""
+    spec = window_spec(cfg)
+    t = when or dt.datetime.now()
+    if spec is None or in_window(cfg, t):
+        return 0
+    start = spec[0]
+    nxt = t.replace(hour=start // 60, minute=start % 60, second=0, microsecond=0)
+    if nxt <= t:
+        nxt += dt.timedelta(days=1)
+    return int((nxt - t).total_seconds())
+
+
+def window_desc(cfg: dict) -> str:
+    spec = window_spec(cfg)
+    if spec is None:
+        return "不限时段"
+    w = cfg.get("window") or {}
+    return f"{w.get('start') or '23:00'}-{w.get('end') or '09:00'}"
 
 
 def quota_headers(q: dict) -> dict:
@@ -1355,6 +1416,16 @@ def cmd_doctor(a) -> int:
     rot = int(cfg["feed"].get("rotate_after_turns") or 0)
     print(f"[{'OK ' if rot else 'WARN'}] 对话轮换："
           + (f"每个对话跑满 {rot} 轮就换新对话" if rot else "未开启（长时间续同一个对话会让上下文越滚越大、白烧额度）"))
+    if window_spec(cfg) is None:
+        print("[-- ] 允许时段：不限（全天都会跑）")
+    else:
+        inside = in_window(cfg)
+        wait = seconds_until_window(cfg)
+        print(f"[{'OK ' if inside else '-- '}] 允许时段：{window_desc(cfg)}"
+              + ("（现在就在时段内）" if inside else
+                 f"（现在时段外，要到 {(dt.datetime.now() + dt.timedelta(seconds=wait)).strftime('%m-%d %H:%M')} 才开始）"))
+    if str(cfg["quota"].get("stop_action") or "exit").lower() == "wait":
+        print(f"[OK ] 额度不足时：原地等（阈值 {cfg['quota'].get('stop_below', 0):,}）")
     if ok_app:
         # 每个配了 model.want 的 agent 各自探一次：不同应用、不同窗口，不能共用一个结果
         for spec in agentlib.agent_specs(cfg):
@@ -1519,6 +1590,11 @@ def cmd_status(a) -> int:
     cfg = load_config(a.config)
     st = State(cfg)
     print(f"配置: {config_source()}")
+    if window_spec(cfg) is not None:
+        inside = in_window(cfg)
+        print(f"允许时段: {window_desc(cfg)} —— "
+              + ("在时段内" if inside else
+                 f"时段外（{seconds_until_window(cfg) // 60} 分钟后开始）"))
     r = quota_rate(st)
     if r["rate"] is None:
         print("额度速率: 样本不足（至少要有两个采样点）")
@@ -1646,6 +1722,8 @@ def cmd_run(a) -> int:
                f" 会话={describe_selection(acfg)}"
                f" 间隔={acfg['feed']['interval_seconds']}s")
     st.log(f"额度源={cfg['quota']['provider']}；STOP 文件={st.stop_file}")
+    st.log(f"允许时段={window_desc(cfg)}"
+           + ("" if in_window(cfg) else "（现在不在时段内，先等着）"))
     cycle = 0
     fails: dict[str, int] = {}
     last_refresh = 0.0
@@ -1654,6 +1732,9 @@ def cmd_run(a) -> int:
     last_run: dict[str, float] = {}
     remaining: int | None = None
     gw = "disabled"
+    paused = False                 # 时段外暂停中（只用来把日志压成一条）
+    quota_waiting = False          # 等额度中
+    nxt_quota_log = 0.0
     try:
         while True:
             if st.stop_file.exists():
@@ -1664,6 +1745,25 @@ def cmd_run(a) -> int:
             specs = agentlib.enabled_agents(cfg)
             st.heartbeat()
             now_ts = time.time()
+
+            # 0) 允许时段：只在 23:00-09:00 这类时间窗里干活
+            if not in_window(cfg):
+                if not paused:
+                    secs = seconds_until_window(cfg)
+                    nxt = dt.datetime.now() + dt.timedelta(seconds=secs)
+                    st.log(f"不在允许时段（{window_desc(cfg)}）→ 暂停，"
+                           f"{nxt.strftime('%m-%d %H:%M')} 自动开始")
+                    paused = True
+                st.status(state="paused", reason="outside-window",
+                          window=window_desc(cfg), remaining=remaining, agents=agentlib.describe(cfg, st))
+                if _sleep_or_stop(st, max(5, min(60, seconds_until_window(cfg)))):
+                    st.log("发现 STOP 文件 → 收工")
+                    st.status(state="stopped", reason="stop-file")
+                    return 0
+                continue
+            if paused:
+                st.log(f"进入允许时段（{window_desc(cfg)}）→ 继续")
+                paused = False
 
             # 1) 网关保活（只探活，不重启）—— 每 60 秒一次，别让 pwsh 每 5 秒起一个
             if now_ts - last_gateway >= 60:
@@ -1681,9 +1781,29 @@ def cmd_run(a) -> int:
                         refresh_quota(cfg)
                         last_refresh = now_ts
                     if q.get("stop_below") and remaining <= q["stop_below"]:
+                        action = str(q.get("stop_action") or "exit").lower()
+                        if action == "wait":
+                            # 夜间跑的时候额度常常是 0（每日额度按天重置），
+                            # 直接收工就白等了，所以可以选择原地等
+                            quota_waiting = True
+                            if now_ts >= nxt_quota_log:
+                                st.log(f"额度 {remaining:,} ≤ 阈值 {q['stop_below']:,} → 原地等额度"
+                                       "（每分钟复查一次，够了自动继续；不想等就把 stop_action 改成 exit）")
+                                nxt_quota_log = now_ts + 600
+                            st.status(state="waiting", reason="quota", remaining=remaining,
+                                      window=window_desc(cfg))
+                            if _sleep_or_stop(st, 60):
+                                st.log("发现 STOP 文件 → 收工")
+                                st.status(state="stopped", reason="stop-file")
+                                return 0
+                            continue
                         st.log(f"额度 {remaining:,} ≤ 阈值 {q['stop_below']:,} → 收工")
                         st.status(state="finished", reason="quota", remaining=remaining)
                         return 0
+                if quota_waiting and remaining is not None and (
+                        not q.get("stop_below") or remaining > q["stop_below"]):
+                    st.log(f"额度回来了（{remaining:,}）→ 继续干活")
+                    quota_waiting = False
 
             # 3) 交接文件：按「监督者写的下一步」排队，不等它同步返回
             worker = agentlib.orchestrator(cfg)[1]
