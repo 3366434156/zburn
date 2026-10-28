@@ -1339,6 +1339,9 @@ def cmd_doctor(a) -> int:
               + (f"剩余 {remaining:,}" if remaining is not None else "读取失败"))
         if remaining is not None and cfg["quota"].get("stop_below"):
             print(f"     低于 {cfg['quota']['stop_below']:,} 时自动收工")
+            if remaining <= cfg["quota"]["stop_below"]:
+                print("     ⚠ 当前额度已经低于阈值：现在启动 run 会立刻收工。"
+                      "换号/加额度后先跑一次 zburn accounts 确认")
 
     tpls = cfg["prompt"]["templates"]
     ascii_bad = [t for t in tpls if any(ord(c) > 126 for c in t)]
@@ -1679,7 +1682,7 @@ def cmd_run(a) -> int:
                         last_refresh = now_ts
                     if q.get("stop_below") and remaining <= q["stop_below"]:
                         st.log(f"额度 {remaining:,} ≤ 阈值 {q['stop_below']:,} → 收工")
-                        st.status(state="finished", remaining=remaining)
+                        st.status(state="finished", reason="quota", remaining=remaining)
                         return 0
 
             # 3) 交接文件：按「监督者写的下一步」排队，不等它同步返回
