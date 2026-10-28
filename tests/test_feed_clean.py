@@ -59,7 +59,8 @@ def test_feed_clean_does_not_retry_when_everyone_is_busy(monkeypatch):
     assert st.line == []
 
 
-def test_feed_clean_retries_when_nothing_went_in(monkeypatch):    calls = []
+def test_feed_clean_retries_when_nothing_went_in(monkeypatch):
+    calls = []
 
     def fake_feed(cfg, st, prompt, dry_run=False):
         calls.append(prompt)
