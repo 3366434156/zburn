@@ -31,6 +31,10 @@ param(
     [int]$CharDelayMs = 18,
     [switch]$DryRun,
     [switch]$Json,
+    # 只把对话点开、确认输入框就绪，不投喂。用途：应用被强杀重启后常常停在
+    # 「没打开任何对话」的状态，树里根本没有 Edit —— 这时会被误判成
+    # 「无障碍树被禁用」，然后反复重启应用（越修越糟）。
+    [switch]$OpenOnly,
     [int]$MaxDepth = 40
 )
 $ErrorActionPreference = 'Stop'
@@ -265,12 +269,34 @@ if ($DryRun) {
     foreach ($t in $tasks) { Write-Output ("  - {0}  ({1},{2} {3}x{4})" -f $t.Name, [int]$t.X, [int]$t.Y, [int]$t.W, [int]$t.H) }
     exit 0
 }
-if (-not $Prompt) {
+if (-not $Prompt -and -not $OpenOnly) {
     [Console]::Error.WriteLine('没有 -Prompt：真要投喂必须给指令（只扫描请加 -DryRun）')
     exit 3
 }
 
 $done = 0; $skipped = 0; $failed = 0
+
+if ($OpenOnly) {
+    # 优先点监控名单/正则命中的那个；一个都没命中就点侧栏第一个（只要是对话就行，
+    # 目的只是把输入框叫出来），不投喂任何内容。
+    $t = $tasks | Select-Object -First 1
+    if (-not $t -and $sideItems.Count -gt 0) { $t = $sideItems[0] }
+    if (-not $t) { [Console]::Error.WriteLine('侧栏里没有可打开的对话'); exit 3 }
+    $label = $t.Name.Substring(0, [Math]::Min(26, $t.Name.Length))
+    try { $t.El.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select() }
+    catch {
+        try { $t.El.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
+        catch { [Console]::Error.WriteLine("点不开这个对话：[$label]"); exit 5 }
+    }
+    $composer = $null
+    for ($w = 0; $w -lt 10 -and -not $composer; $w++) {
+        Start-Sleep -Milliseconds 900
+        $composer = Find-Composer (Get-Controls)
+    }
+    if ($composer) { Write-Output ("已打开对话 [{0}]，输入框就绪" -f $label); exit 0 }
+    [Console]::Error.WriteLine(("对话 [{0}] 打开了，但还是没有输入框" -f $label)); exit 2
+}
+
 foreach ($t in $tasks) {
     if ($done -ge $MaxSessions) { break }
     $label = $t.Name.Substring(0, [Math]::Min(26, $t.Name.Length))

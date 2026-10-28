@@ -1057,6 +1057,33 @@ def write_supervisor_bridge(cfg: dict, st: State, sup: dict, work: dict | None,
                                  supervisor_name=sup.get("name", ""))
 
 
+def open_session(cfg: dict) -> tuple[int, str]:
+    """把聊天窗口里的一个对话点开（不投喂），让输入框出现。
+
+    应用被强杀/崩溃重启后，ZCode 常常停在「一个对话都没打开」的空状态：侧栏和按钮
+    都在，就是没有输入框。uia_ok 是按「有没有输入框」判断健康的，于是会误判成
+    「无障碍树被禁用」→ 重启应用 → 还是空状态 → 再重启，一晚上白重启十几次。
+    先试着点开一个对话，能点开就不算故障。
+    """
+    params = {
+        "ProcessName": cfg["app"]["process_name"],
+        "WindowTitleRegex": cfg["uia"].get("window_title_regex", ""),
+        "SessionRegex": cfg["uia"].get("session_regex", "") or ".",
+        "Targets": json.dumps(feed_targets(cfg), ensure_ascii=False),
+        "BusyRegex": cfg["uia"]["busy_regex"],
+        "QueuedRegex": cfg["uia"]["queued_regex"],
+        "MaxSessions": 1,
+        "MaxDepth": cfg["uia"]["max_depth"],
+        "OpenOnly": True,
+    }
+    try:
+        code, out, err = run_ps("feed-sessions.ps1", params, timeout=180)
+    except Exception as e:                      # noqa: BLE001
+        return 1, f"{type(e).__name__}: {e}"
+    lines = [ln.strip() for ln in (out or "").strip().splitlines() if ln.strip()]
+    return code, (lines[-1] if lines else (err or "").strip()[:160] or f"exit {code}")
+
+
 def apply_handoff(cfg: dict, st: State, rec: dict, worker: dict | None = None) -> dict | None:
     target = worker
     if rec.get("agent"):
@@ -1112,22 +1139,41 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
 
     ok_uia, why = uia_ok(acfg)
     if not ok_uia:
-        streak = int((agentlib.read_state(st, aid) or {}).get("uia_fail_streak") or 0) + 1
+        # 「找不到输入框」有一半不是 a11y 挂了，而是应用停在「没打开任何对话」的空状态。
+        # 先点开一个对话再看一次，能救回来就不算故障（重启应用会打断正在生成的任务）。
+        if "输入框" in str(why) and not dry_run:
+            oc, om = open_session(acfg)
+            st.log(f"[{aid}] 试着点开一个对话（{om}）")
+            if oc == 0:
+                ok_uia, why = uia_ok(acfg)
+                if ok_uia:
+                    agentlib.update_state(st, aid, uia_fail_streak=0)
+    if not ok_uia:
+        state = agentlib.read_state(st, aid) or {}
+        streak = int(state.get("uia_fail_streak") or 0) + 1
         agentlib.update_state(st, aid, uia_fail_streak=streak)
         st.log(f"[{aid}] 无障碍树不可用（{why}），连续第 {streak} 次")
         # 只有连续 3 次（≈3 分钟）都读不到才重启应用：重启会打断正在生成的会话，
         # 单次探测失败往往只是应用在忙 / 我们的探针撞在一起，不值得动手。
+        cooldown = float(acfg["app"].get("restart_cooldown_seconds") or 300)
+        last_kill = float(state.get("last_app_restart_ts") or 0)
         if (IS_WIN and acfg["app"].get("start_if_down")
                 and acfg["app"].get("restart_on_uia_fail", True) and streak >= 3):
-            pname = acfg["app"]["process_name"]
-            subprocess_hidden([pwsh(), "-NoProfile", "-Command",
-                               f"Stop-Process -Name '{str(pname).replace(chr(39), chr(39) * 2)}' "
-                               f"-Force -ErrorAction SilentlyContinue"])
-            time.sleep(3)
-            ok, why2 = start_app(acfg)
-            st.log(f"[{aid}] 重启应用：{'成功' if ok else '失败'} {why2}")
-            agentlib.update_state(st, aid, uia_fail_streak=0)
-            time.sleep(15)
+            if time.time() - last_kill < cooldown:
+                # 刚重启过还是读不到：再重启只会变成「重启 ↔ 读不到」的死循环，
+                # 换成等它自己起来（应用刚启动时树常常是空的）
+                st.log(f"[{aid}] {int(cooldown)} 秒内刚重启过，先不重启（等应用自己渲染完）")
+            else:
+                pname = acfg["app"]["process_name"]
+                subprocess_hidden([pwsh(), "-NoProfile", "-Command",
+                                   f"Stop-Process -Name '{str(pname).replace(chr(39), chr(39) * 2)}' "
+                                   f"-Force -ErrorAction SilentlyContinue"])
+                time.sleep(3)
+                ok, why2 = start_app(acfg)
+                st.log(f"[{aid}] 重启应用：{'成功' if ok else '失败'} {why2}")
+                agentlib.update_state(st, aid, uia_fail_streak=0,
+                                      last_app_restart_ts=time.time())
+                time.sleep(15)
         agentlib.update_state(st, aid, last_run=now(), last_result=f"uia: {why}")
         return 1, f"uia: {why}"
     agentlib.update_state(st, aid, uia_fail_streak=0)
