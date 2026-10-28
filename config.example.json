@@ -34,7 +34,9 @@
     "max_sessions": 5,
     "interval_seconds": 120,
     "targets": [],
-    "rotate_after_turns": 3
+    "rotate_after_turns": 3,
+    "compact_at_tokens": 300000,
+    "compact_command": "/compact"
   },
   "model": {
     "want": "zcode2api",

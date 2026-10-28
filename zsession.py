@@ -230,6 +230,100 @@ def context(cfg: dict, targets: list[str] | None = None,
         con.close()
 
 
+def _latest_context(con: sqlite3.Connection, sid: str) -> int:
+    """会话当前的上下文 token 数 = 最近一次非零 input_tokens 的模型请求。
+
+    model_usage 每行是一次模型请求，input_tokens 就是那次发过去的完整上下文，
+    和 UI「上下文容量」显示的是同一个数（已实测对上）；turn_usage 是一整轮
+    多次请求的累计，不能拿来当上下文。取「最近一条非零」是因为失败/取消的
+    请求记 0，不代表会话真的空了。
+    """
+    try:
+        row = con.execute(
+            "select input_tokens from model_usage "
+            "where session_id=? and input_tokens>0 order by started_at desc limit 1",
+            (sid,)).fetchone()
+    except Exception:
+        return 0
+    return int(row["input_tokens"]) if row else 0
+
+
+def session_contexts(cfg: dict, *, targets: list[str] | None = None,
+                     session_regex: str = "") -> list[dict] | None:
+    """被监控会话的当前上下文（token），按最近更新排序；返回 None = 会话库不可用。
+
+    匹配规则与投喂一致：targets（标题，宽松前后缀 + 标题#序号）优先，
+    其次 session_regex（对完整标题匹配）。名单一条都没对上 / 库打不开 /
+    没配置筛选时返回 None —— 调用方要把压缩闸门当「失明」处理：
+    继续原投喂流程，绝不能因为读不到上下文就停喂。
+    """
+    db = (cfg.get("uia") or {}).get("session_db")
+    if db is None or str(db).strip().lower() in ("-", "none", "off", "disabled"):
+        return None
+    con = _connect(str(db).strip() or default_db())
+    if con is None:
+        return None
+    try:
+        rows = [dict(r) for r in con.execute(
+            "select id,title,time_updated,time_compacting from session "
+            "where time_deleted is null order by time_updated desc")]
+        if not rows:
+            return None
+        wanted: list[dict] = []
+        for raw in (targets or []):
+            raw = (raw or "").strip()
+            if not raw:
+                continue
+            m = re.match(r"^(.*)#(\d+)$", raw)
+            want = _key(m.group(1) if m else raw)
+            if not want:
+                continue
+            exact = [r for r in rows if _key(r.get("title", "")) == want]
+            if m and exact:
+                # 「标题#序号」只取同名组里的第 N 条
+                pick = exact[min(max(int(m.group(2)), 1), len(exact)) - 1]
+                if pick not in wanted:
+                    pick["matched"] = raw
+                    wanted.append(pick)
+                continue
+            loose = [r for r in rows
+                     if _key(r.get("title", "")).startswith(want)
+                     or want.startswith(_key(r.get("title", ""))[:max(8, len(want) - 3)])]
+            for r in (exact or loose):
+                if r not in wanted:
+                    r["matched"] = raw        # 记住按哪条名单匹配的，定向投喂要用它
+                    wanted.append(r)
+        if wanted:
+            pass
+        elif any((t or "").strip() for t in (targets or [])):
+            # 名单一条都没对上：闸门失明，不回退正则（和投喂「名单优先」的行为一致）
+            return None
+        elif session_regex:
+            try:
+                rx = re.compile(session_regex)
+            except re.error:
+                return None
+            wanted = [r for r in rows if rx.search(r.get("title", ""))]
+        else:
+            return None
+        out = []
+        for r in wanted:
+            out.append({
+                "id": r["id"],
+                "title": r.get("title") or "",
+                # 按哪条名单条目匹配上的（保留「标题#序号」写法）；正则命中的就是标题本身
+                "matched": r.get("matched") or (r.get("title") or ""),
+                "context_tokens": _latest_context(con, r["id"]),
+                "compacting": bool(r.get("time_compacting")),
+                "updated": r.get("time_updated"),
+            })
+        return out
+    except Exception:
+        return None
+    finally:
+        con.close()
+
+
 def latest_session(cfg: dict, work_dir: str = "") -> dict | None:
     """最近更新的会话（新对话发出后，用它把新会话加进动态监控名单）。"""
     db = (cfg.get("uia") or {}).get("session_db")

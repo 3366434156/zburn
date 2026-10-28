@@ -91,7 +91,14 @@ DEFAULT_CONFIG = {
         ],
         "file": "next-prompt.txt",
     },
-    "feed": {"max_sessions": 5, "interval_seconds": 120, "targets": []},
+    "feed": {"max_sessions": 5, "interval_seconds": 120, "targets": [],
+             # 一个对话跑满几轮就换新的（README 写的默认 3）；0 = 不换
+             "rotate_after_turns": 3,
+             # 上下文压缩闸门：被监控会话滚过这个 token 数就先投 compact_command
+             # 压回去，而不是继续往里灌 continue（88 万 token 的会话每续一句
+             # 都整段历史重发，白烧额度）。0 = 关闭。
+             "compact_at_tokens": 300000,
+             "compact_command": "/compact"},
     "gateway": {
         "health_url": "http://127.0.0.1:3000/meta",
         "start_command": "",
@@ -644,17 +651,22 @@ def flush_composer(cfg: dict) -> None:
         pass
 
 
-def feed_clean(cfg: dict, st: State, prompt: str, dry_run: bool = False) -> tuple[int, str]:
+def feed_clean(cfg: dict, st: State, prompt: str, dry_run: bool = False,
+               only_targets: list[str] | None = None) -> tuple[int, str]:
     """投喂的稳妥版：先腾空、失败再腾空重投一次。
 
     「成功」的判据是**这一轮至少有一个会话真的被喂进去了**，而不是「零失败」：
     监控 3 个会话时，其中一个常年 busy/卡住是常态，为它整轮重投等于把同一条指令
     往刚开跑的那个会话里再灌一遍（还会把它的上下文推快一倍）。
+
+    only_targets 给定时只投这几个会话（按标题精确定向，忽略 session_regex）——
+    压缩闸门用它把 /compact 只送进超限的会话，健康会话照常续派。
     """
+    kw = {} if only_targets is None else {"only_targets": only_targets}
     if dry_run:
         return feed_once(cfg, st, prompt, dry_run=True)
     flush_composer(cfg)
-    code, summary = feed_once(cfg, st, prompt)
+    code, summary = feed_once(cfg, st, prompt, **kw)
     stats = feed_stats(summary)
     if code in (3, 4, 6):                       # 4=指令非法 3=没指定会话 6=结构性问题：重投也一样
         return code, summary
@@ -666,7 +678,7 @@ def feed_clean(cfg: dict, st: State, prompt: str, dry_run: bool = False) -> tupl
     st.log(f"[feed] 首次未成功（{summary}）→ 腾空输入框后重投")
     flush_composer(cfg)
     time.sleep(3)
-    return feed_once(cfg, st, prompt)
+    return feed_once(cfg, st, prompt, **kw)
 
 
 PROMPT_MAX_DEFAULT = 180      # WM_CHAR 打长了会被吞字，实测 400 字符就开始丢
@@ -709,17 +721,23 @@ def feed_stats(summary: str) -> dict:
     }
 
 
-def feed_once(cfg: dict, st: State, prompt: str, dry_run: bool = False) -> tuple[int, str]:
+def feed_once(cfg: dict, st: State, prompt: str, dry_run: bool = False,
+              only_targets: list[str] | None = None) -> tuple[int, str]:
     prompt = clamp_prompt(cfg, prompt, st)
-    targets = feed_targets(cfg)
-    regex = (cfg["uia"].get("session_regex") or "").strip()
+    if only_targets is None:
+        targets = feed_targets(cfg)
+        regex = (cfg["uia"].get("session_regex") or "").strip()
+    else:
+        # 定向投喂（压缩闸门用）：只认给出来的标题，正则会把别的会话也捞进来
+        targets = [str(t).strip() for t in (only_targets or []) if str(t).strip()]
+        regex = ""
     if not targets and not regex:
         # 空筛选 = 给每个对话灌指令。宁可不动，也不能乱喂。返回 3 跟「投喂失败」区分开。
         return 3, NO_SELECTION_MSG
     params = {
         "ProcessName": cfg["app"]["process_name"],
         "WindowTitleRegex": cfg["uia"].get("window_title_regex", ""),
-        "SessionRegex": regex or ".",
+        "SessionRegex": regex if only_targets is not None else (regex or "."),
         "Targets": json.dumps(targets, ensure_ascii=False),
         "SendButtonRegex": cfg["uia"]["send_button_regex"],
         "BusyRegex": cfg["uia"]["busy_regex"],
@@ -754,6 +772,45 @@ def inject_once(cfg: dict, st: State, text: str, no_enter: bool = False, dry_run
     code, out, err = run_ps("inject-uia.ps1", params, timeout=300)
     st.log((out or "").strip() or (err or "").strip() or f"inject exit {code}")
     return code
+
+
+# ---------------------------------------------------------------- 上下文压缩闸门
+def compact_gate(cfg: dict, st: State) -> tuple[list[dict], list[dict], str] | None:
+    """上下文压缩闸门：被监控会话里谁已滚过阈值、谁还健康。
+
+    返回 (over, under, note)：
+      over  = 上下文 ≥ feed.compact_at_tokens 且不在压缩中的会话（该投 /compact）
+      under = 上下文还在阈值内的会话（可以照常续派）
+    返回 None = 闸门不可用（没开阈值 / 没配筛选 / 读不到会话库 / 名单没匹配上），
+    调用方按原流程投喂 —— 闸门失明时宁可多喂一句，也不能把整个守护停摆。
+    """
+    feed = cfg.get("feed") or {}
+    thr = int(feed.get("compact_at_tokens") or 0)
+    if thr <= 0:
+        return None
+    targets = feed_targets(cfg)
+    regex = (cfg["uia"].get("session_regex") or "").strip()
+    if not targets and not regex:
+        return None
+    try:
+        sessions = zsession.session_contexts(cfg, targets=targets, session_regex=regex)
+    except Exception:
+        sessions = None
+    if not sessions:
+        st.log("[compact] 闸门不可用（会话库读不到或监控名单没匹配上），本轮按原流程投喂")
+        return None
+    over = [s for s in sessions if s["context_tokens"] >= thr and not s["compacting"]]
+    # 正在压缩的会话两头都不进：再投 /compact 只会排队，投 continue 会把刚压完的又灌胖
+    compacting = sum(1 for s in sessions if s["compacting"] and s["context_tokens"] >= thr)
+    under = [s for s in sessions if s["context_tokens"] < thr]
+
+    def _tag(s: dict) -> str:
+        t = s["title"] or s["id"]
+        return f"{t[:36]}{'…' if len(t) > 36 else ''}={s['context_tokens'] // 1000}k"
+
+    note = (f"阈值 {thr // 1000}k：超限 [{'、'.join(_tag(s) for s in over) or '无'}]"
+            f" 压缩中 {compacting} 个 健康 {len(under)} 个")
+    return over, under, note
 
 
 # ---------------------------------------------------------------- 多 agent / 交接
@@ -1150,7 +1207,22 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
             if oc == 0:
                 ok_uia, why = uia_ok(acfg)
                 if ok_uia:
-                    agentlib.update_state(st, aid, uia_fail_streak=0)
+                    agentlib.update_state(st, aid, uia_fail_streak=0, render_fail_streak=0)
+            elif oc == 2:
+                # 对话点开了、但输入框还没渲染出来：这是冷启动/重绘慢，不是 a11y 挂了。
+                # 重启应用没用（重启后同样是空状态，实测 06:41 重启到 06:43 才恢复），
+                # 还会打断正在生成的会话。按「渲染中」跳过，连续 6 轮（≈12 分钟）都这样
+                # 才把它当真正的故障走重启。
+                state = agentlib.read_state(st, aid) or {}
+                rstreak = int(state.get("render_fail_streak") or 0) + 1
+                agentlib.update_state(st, aid, render_fail_streak=rstreak)
+                if rstreak < 6:
+                    st.log(f"[{aid}] 对话点开了但输入框还没渲染出来（第 {rstreak}/6 次）"
+                           "→ 本轮不重启，下一轮再看")
+                    agentlib.update_state(st, aid, last_run=now(), last_action="skip",
+                                          last_result=f"render: {om}")
+                    return 0, f"skip:render {om}"
+                st.log(f"[{aid}] 连续 {rstreak} 轮等不到输入框 → 按无障碍树故障处理")
     if not ok_uia:
         state = agentlib.read_state(st, aid) or {}
         streak = int(state.get("uia_fail_streak") or 0) + 1
@@ -1175,20 +1247,23 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
                 ok, why2 = start_app(acfg)
                 st.log(f"[{aid}] 重启应用：{'成功' if ok else '失败'} {why2}")
                 agentlib.update_state(st, aid, uia_fail_streak=0,
+                                      render_fail_streak=0,
                                       last_app_restart_ts=time.time())
                 time.sleep(15)
         agentlib.update_state(st, aid, last_run=now(), last_result=f"uia: {why}")
         return 1, f"uia: {why}"
-    agentlib.update_state(st, aid, uia_fail_streak=0)
+    agentlib.update_state(st, aid, uia_fail_streak=0, render_fail_streak=0)
 
-    # 1) 有交接：优先执行；新对话在 busy 时保留到下一轮
+    # 1) 有交接：优先执行；新对话是监督者明确要求的「旧的翻篇」，即使当前会话
+    #    还在生成也要建（-Force）。不强制的话 busy/queued 会让这条交接无限重试：
+    #    实测连试 9 轮都停在「当前会话 busy=True queued=True，不新建对话」。
     pending = agentlib.get_pending(st, aid)
     if pending:
         action = pending["action"]
         if action == "new_chat":
             code, summary = new_chat_once(acfg, st, pending["prompt"],
                                           project=pending.get("project", ""),
-                                          dry_run=dry_run, agent_id=aid)
+                                          dry_run=dry_run, agent_id=aid, force=True)
         else:
             code, summary = feed_clean(acfg, st, pending["prompt"], dry_run=dry_run)
         st.log(f"[{aid}] 执行交接 {action}：{summary}")
@@ -1291,11 +1366,51 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
         code, summary = new_chat_once(acfg, st, text,
                                       project=acfg["new_chat"].get("project", ""),
                                       agent_id=aid, force=True)
-        st.log(f"[{aid}] 已跑满 {turns} 轮 → 换新对话（{summary}）")
-        agentlib.update_state(st, aid, turns_on_target=0, last_run=now(),
-                              last_action="new_chat", last_result=summary,
-                              last_feed=now() if code == 0 else "")
-        return (0 if code == 0 else 1), summary
+        if code == 0:
+            st.log(f"[{aid}] 已跑满 {turns} 轮 → 换新对话（{summary}）")
+            agentlib.update_state(st, aid, turns_on_target=0, last_run=now(),
+                                  last_action="new_chat", last_result=summary,
+                                  last_feed=now())
+            return 0, summary
+        # 换不动（「新建任务」滚出可视区等）不能原地打转：旧会话每多一轮更大，
+        # 落到下面的压缩闸门/续派继续推进，下一轮还会再试换新。
+        st.log(f"[{aid}] 已跑满 {turns} 轮但换新对话失败（{summary}）→ 本轮改走压缩/续派")
+
+    # 3b) 压缩闸门：有会话滚过阈值就先把它压回去，而不是继续灌 continue。
+    #     超限会话每续一句都要把几十万 token 的历史整段重发（实测 88 万 token 的
+    #     会话一句 continue ≈ 88 万 input token），轮换兜不住的老会话就是在这
+    #     把额度烧穿的。读不到会话库时闸门返回 None，一切照旧。
+    gate = compact_gate(acfg, st)
+    if gate is not None:
+        over, under, note = gate
+        if not over:
+            pass                                   # 全部健康：闸门只看不动
+        elif dry_run:
+            st.log(f"[{aid}] 压缩闸门（dry-run）：{note}")
+        else:
+            cmd = str(acfg["feed"].get("compact_command") or "/compact").strip() or "/compact"
+            for sess in over[:2]:                  # 一轮最多点两个：投喂是逐字打的
+                c, s = feed_clean(acfg, st, cmd,
+                                  only_targets=[sess.get("matched") or sess["title"]])
+                st.log(f"[{aid}] 上下文 {sess['context_tokens']:,} ≥ 阈值 → 投 {cmd}：{s}")
+            agentlib.update_state(st, aid, last_run=now(), last_action="compact",
+                                  last_result=note)
+            if not under:
+                # 全都超限/在压缩：这轮不再喂 continue，等压缩落地，下轮上下文
+                # 掉回阈值内就自动恢复续派
+                return 0, f"skip:compact {note}"
+            prompt = build_prompt(acfg, st, cycle, remaining)
+            code, summary = feed_clean(acfg, st, prompt,
+                                       only_targets=[s.get("matched") or s["title"]
+                                                     for s in under])
+            st.log(f"[{aid}] 第 {cycle} 轮投喂（仅健康会话，超限的先压着）：{summary}")
+            stats = feed_stats(summary)
+            fed = code == 0 and not stats["failed"] and not stats["busy"]
+            agentlib.update_state(st, aid, last_run=now(), last_action="feed",
+                                  last_result=summary, last_typed=stats["typed"],
+                                  turns_on_target=(turns + 1) if fed else turns,
+                                  last_feed=now() if fed else "")
+            return (0 if code in (0, 3) else 1), summary
 
     prompt = build_prompt(acfg, st, cycle, remaining)
     code, summary = feed_clean(acfg, st, prompt, dry_run=dry_run)
@@ -1479,6 +1594,12 @@ def cmd_doctor(a) -> int:
     rot = int(cfg["feed"].get("rotate_after_turns") or 0)
     print(f"[{'OK ' if rot else 'WARN'}] 对话轮换："
           + (f"每个对话跑满 {rot} 轮就换新对话" if rot else "未开启（长时间续同一个对话会让上下文越滚越大、白烧额度）"))
+    ct = int(cfg["feed"].get("compact_at_tokens") or 0)
+    cc = str(cfg["feed"].get("compact_command") or "/compact")
+    print(f"[{'OK ' if ct else 'WARN'}] 上下文压缩："
+          + (f"被监控会话 ≥ {ct:,} token 时投 {cc} 压回去"
+             "（上下文从 ZCode 会话库 model_usage 读；库打不开闸门自动失效）" if ct
+             else "未开启（feed.compact_at_tokens=0，会话上下文会一直滚大）"))
     if window_spec(cfg) is None:
         print("[-- ] 允许时段：不限（全天都会跑）")
     else:

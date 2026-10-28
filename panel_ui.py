@@ -304,10 +304,13 @@ input:hover,textarea:hover{border-color:#2c3a4d}
       </div>
       <div class="g3">
         <div><label>对话轮换(轮) <b>0=不换</b></label><input id="cfgRotate" type="number" min="0" step="1" placeholder="3"></div>
+        <div><label>压缩阈值(token) <b>0=关</b></label><input id="cfgCompact" type="number" min="0" step="50000" placeholder="300000"></div>
         <div><label>指令上限(字符)</label><input id="cfgMaxChars" type="number" min="0" step="10" placeholder="180"></div>
         <div><label>钉死的模型</label><input id="cfgModelWant" placeholder="zcode2api"></div>
       </div>
       <div class="hint">轮换：一个对话跑满这么多轮就换新的（上下文平方级膨胀，不换就是白烧额度）。
+        压缩阈值：被监控会话的上下文滚过这个 token 数（从 ZCode 会话库读，和界面「上下文容量」同源）
+        就先投 /compact 压回去，超限期间不再给它灌 continue。
         指令上限：WM_CHAR 打太长会丢字，超出的部分会被截掉。钉死的模型：新对话后自动复查，
         不对就切回去；切不回去宁可这一轮不投喂。</div>
     </div>
@@ -594,6 +597,7 @@ async function saveCfg(){
     interval_seconds: +val('cfgInterval'),
     max_sessions: +val('cfgMax'),
     rotate_after_turns: +val('cfgRotate'),
+    compact_at_tokens: +val('cfgCompact'),
     prompt_max_chars: +val('cfgMaxChars'),
     model_want: val('cfgModelWant'),
     stop_below: +val('cfgStop'),
@@ -811,6 +815,7 @@ async function load(){
     set('cfgInterval', s.config.interval_seconds);
     set('cfgMax', s.config.max_sessions);
     set('cfgRotate', s.config.rotate_after_turns);
+    set('cfgCompact', s.config.compact_at_tokens);
     set('cfgMaxChars', s.config.prompt_max_chars);
     set('cfgModelWant', s.config.model_want);
     set('cfgStop', s.config.stop_below);

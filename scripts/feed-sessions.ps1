@@ -338,22 +338,44 @@ if (-not $Prompt -and -not $OpenOnly) {
 $done = 0; $skipped = 0; $failed = 0
 
 if ($OpenOnly) {
-    # 优先点监控名单/正则命中的那个；一个都没命中就点侧栏第一个（只要是对话就行，
-    # 目的只是把输入框叫出来），不投喂任何内容。
-    $t = $tasks | Select-Object -First 1
-    if (-not $t -and $sideItems.Count -gt 0) { $t = $sideItems[0] }
-    if (-not $t) { [Console]::Error.WriteLine('侧栏里没有可打开的对话'); exit 3 }
-    $label = $t.Name.Substring(0, [Math]::Min(26, $t.Name.Length))
-    $sw = Switch-Session $t
-    if (-not $sw.Ok) { [Console]::Error.WriteLine("点不开这个对话：[$label]（$($sw.Err)）"); exit 5 }
-    $t = $sw.Item
-    $composer = $null
-    for ($w = 0; $w -lt 10 -and -not $composer; $w++) {
-        Start-Sleep -Milliseconds 900
-        $composer = Find-Composer (Get-Controls)
+    # 重启/冷启动后应用常停在「没打开任何对话」的空白状态：侧栏可能还没渲染，
+    # 点开一个对话后输入框也要等更久。先等侧栏，再最多试 3 个对话、每个等 30 秒，
+    # 比「3 次读不到就重启应用」温和得多：重启会打断正在生成的会话，
+    # 而且重启后还是空状态（实测 06:41 重启，到 06:43 才恢复投喂）。
+    if ($sideItems.Count -eq 0) {
+        for ($w = 0; $w -lt 30 -and $sideItems.Count -eq 0; $w++) {
+            Start-Sleep -Milliseconds 1000
+            $all = Get-Controls
+            $sideItems = @($all | Where-Object {
+                    ($_.Type -eq 'ControlType.ListItem' -or $_.Type -eq 'ControlType.TreeItem') -and $_.Name -and
+                    (($_.X - $winX) -lt $winW * 0.45) -and $_.W -gt 40 -and $_.H -gt 12
+                })
+        }
     }
-    if ($composer) { Write-Output ("已打开对话 [{0}]，输入框就绪" -f $label); exit 0 }
-    [Console]::Error.WriteLine(("对话 [{0}] 打开了，但还是没有输入框" -f $label)); exit 2
+    # 名单/正则命中的优先，其余侧栏对话兜底（目的只是把输入框叫出来）
+    $cands = @($tasks) + @($sideItems | Where-Object { $tasks -notcontains $_ })
+    if ($cands.Count -eq 0) {
+        [Console]::Error.WriteLine('侧栏里没有可打开的对话（等了 30 秒仍为空）'); exit 3
+    }
+    $tried = 0
+    foreach ($t in ($cands | Select-Object -First 3)) {
+        $tried++
+        $label = $t.Name.Substring(0, [Math]::Min(26, $t.Name.Length))
+        $sw = Switch-Session $t
+        if (-not $sw.Ok) {
+            Write-Output ("  [{0}] 点不开（{1}）" -f $label, $sw.Err)
+            continue
+        }
+        $t = $sw.Item
+        $composer = $null
+        for ($w = 0; $w -lt 30 -and -not $composer; $w++) {
+            Start-Sleep -Milliseconds 1000
+            $composer = Find-Composer (Get-Controls)
+        }
+        if ($composer) { Write-Output ("已打开对话 [{0}]，输入框就绪" -f $label); exit 0 }
+        Write-Output ("  [{0}] 打开了，但 30 秒内没有输入框" -f $label)
+    }
+    [Console]::Error.WriteLine(("试了 {0} 个对话都没等到输入框" -f $tried)); exit 2
 }
 
 foreach ($t in $tasks) {

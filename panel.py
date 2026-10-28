@@ -188,6 +188,7 @@ CONFIG_FIELDS: dict[str, tuple[tuple[str, str], type]] = {
     "interval_seconds": (("feed", "interval_seconds"), int),
     "max_sessions": (("feed", "max_sessions"), int),
     "rotate_after_turns": (("feed", "rotate_after_turns"), int),
+    "compact_at_tokens": (("feed", "compact_at_tokens"), int),
     "prompt_max_chars": (("prompt", "max_chars"), int),
     "model_want": (("model", "want"), str),
     "health_url": (("gateway", "health_url"), str),
@@ -354,6 +355,7 @@ def collect(cfg: dict, st, sup: Supervisor, tail: int = 120,
             "max_sessions": cfg["feed"]["max_sessions"],
             "interval_seconds": cfg["feed"]["interval_seconds"],
             "rotate_after_turns": int(cfg["feed"].get("rotate_after_turns") or 0),
+            "compact_at_tokens": int(cfg["feed"].get("compact_at_tokens") or 0),
             "prompt_max_chars": cfg["prompt"].get("max_chars"),
             # 顶层没写就显示某个 agent 实际在用的那个，别让面板显示成空
             "model_want": ((cfg.get("model") or {}).get("want")

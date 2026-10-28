@@ -78,17 +78,44 @@ def test_run_agent_once_opens_session_instead_of_counting_a_strike(tmp_path, mon
     assert any("点开一个对话" in ln for ln in st.lines)
 
 
-def test_uia_failure_restart_respects_cooldown(tmp_path, monkeypatch):
-    """刚重启过还是读不到：不许无限重启（否则一晚上重启十几次，全在打断任务）。"""
+def test_render_slow_is_not_a_uia_strike(tmp_path, monkeypatch):
+    """对话点开了、输入框还没渲染出来：本轮跳过，不重启也不记 a11y 失败。
+
+    重启应用会打断正在生成的会话，而且重启后还是空状态（实测 06:41 重启，
+    06:43 才恢复投喂），3 次读不到就杀进程只会变成重启死循环。
+    """
     st = _St(tmp_path)
     cfg = _cfg(tmp_path)
-    agents.update_state(st, "zcode", uia_fail_streak=2,
+    agents.update_state(st, "zcode", uia_fail_streak=2)
+    killed = {"n": 0}
+    monkeypatch.setattr(zburn, "app_running", lambda acfg: True)
+    monkeypatch.setattr(zburn, "uia_ok", lambda acfg: (False, "找不到输入框"))
+    monkeypatch.setattr(zburn, "open_session", lambda acfg: (2, "试了 1 个对话都没等到输入框"))
+    monkeypatch.setattr(zburn, "subprocess_hidden",
+                        lambda *a, **kw: killed.__setitem__("n", killed["n"] + 1))
+    monkeypatch.setattr(zburn, "start_app", lambda acfg: killed.__setitem__("n", killed["n"] + 1))
+
+    code, summary = zburn.run_agent_once(cfg, st, agents.agent_specs(cfg)[0], 1, None)
+    assert code == 0 and summary.startswith("skip:render")
+    assert killed["n"] == 0
+    state = agents.read_state(st, "zcode")
+    assert state["uia_fail_streak"] == 2            # 没把「渲染慢」记成 a11y 故障
+    assert state["render_fail_streak"] == 1
+    assert any("不重启" in ln for ln in st.lines)
+
+
+def test_render_stuck_after_six_rounds_still_respects_cooldown(tmp_path, monkeypatch):
+    """连续 6 轮都等不到输入框才算真故障；刚重启过依旧不许再重启。"""
+    st = _St(tmp_path)
+    cfg = _cfg(tmp_path)
+    agents.update_state(st, "zcode", uia_fail_streak=2, render_fail_streak=5,
                         last_app_restart_ts=time.time())
     killed = {"n": 0}
     monkeypatch.setattr(zburn, "app_running", lambda acfg: True)
     monkeypatch.setattr(zburn, "uia_ok", lambda acfg: (False, "找不到输入框"))
-    monkeypatch.setattr(zburn, "open_session", lambda acfg: (2, "点开了但没有输入框"))
-    monkeypatch.setattr(zburn, "subprocess_hidden", lambda *a, **kw: killed.__setitem__("n", killed["n"] + 1))
+    monkeypatch.setattr(zburn, "open_session", lambda acfg: (2, "试了 1 个对话都没等到输入框"))
+    monkeypatch.setattr(zburn, "subprocess_hidden",
+                        lambda *a, **kw: killed.__setitem__("n", killed["n"] + 1))
     monkeypatch.setattr(zburn, "start_app", lambda acfg: killed.__setitem__("n", killed["n"] + 1))
 
     code, summary = zburn.run_agent_once(cfg, st, agents.agent_specs(cfg)[0], 1, None)
