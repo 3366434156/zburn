@@ -71,3 +71,30 @@ def test_quota_rate_uses_window(tmp_path):
 def test_quota_rate_needs_two_points(tmp_path):
     rows = [(dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 5)]
     assert zburn.quota_rate(_state_with_history(tmp_path, rows)) == (None, None)
+
+def test_supervisor_seed_is_ascii_and_short():
+    acfg = {"prompt": {"max_chars": 180}}
+    seed = zburn.supervisor_seed(acfg)
+    assert seed.isascii()
+    assert len(seed) <= 180
+    assert "supervisor" in seed.lower()
+
+
+def test_wake_fingerprint_changes_with_worker_state(tmp_path, monkeypatch):
+    import agents
+    monkeypatch.setattr(agents, "bridge_dir", lambda cfg: tmp_path)
+
+    class S:
+        status_path = tmp_path / "status.json"
+        dir = tmp_path
+
+    S.status_path.write_text("cycle=1", encoding="utf-8")
+    f1 = zburn.wake_fingerprint({}, S())
+    f2 = zburn.wake_fingerprint({}, S())
+    assert f1 == f2                       # 没变化 → 不该唤醒
+
+    S.status_path.write_text("cycle=2", encoding="utf-8")
+    assert zburn.wake_fingerprint({}, S()) != f1
+
+    (tmp_path / "context.txt").write_text("worker tail", encoding="utf-8")
+    assert zburn.wake_fingerprint({}, S()) != f1

@@ -195,3 +195,27 @@ python zburn.py newchat --config config.json --agent zcode --project zburn --pro
   另一个号的额度一分没动（实测：一个号 500 万整桶未使用）。
 * **看速率**：`zburn status` 第一行会打印「近一小时掉多少 / 约多少 tokens 每小时」，
   速率高但任务没推进 = 空转，先降频（`interval_seconds` 300）再看。
+
+## 8. 监督通道的四个必须（2026-10-28 二次实测）
+
+夜里 supervisor 被叫醒了 **158 轮**，全在同一个工作对话里刷 WAIT，会话堆到 1.5M 输入 token。
+现在这四条规定写进代码了：
+
+1. **专用对话**：`agents[dsh].uia.session_regex = "zburn supervisor"`，
+   唤醒只打到标题以它开头的对话；找不到就**自动新建**一个（`supervisor_seed()`），
+   绝不再往「随便一个工作对话」里灌。
+2. **没变化不叫醒**：`orchestrator.skip_when_idle`。唤醒前先算指纹
+   （`status.json` + `context.txt` + 有没有待处理交接），指纹没变直接跳过，日志写
+   `监督：worker 无变化，跳过本轮唤醒`。
+3. **限频**：`orchestrator.max_wakes_per_hour`（默认 6），超了跳过。
+4. **轮换**：`agents[dsh].feed.rotate_after_turns`（默认 3）。监督对话跑满就换一个新的
+   —— 它是长对话，压缩也追不上膨胀速度。
+
+唤醒词本身只做一件事：**让 supervisor 去读桥里的任务书**。
+
+```
+Read C:\Users\Administrator\AppData\Local\zburn-bridge\supervisor-task.txt and follow it exactly. Reply DONE when finished.
+```
+
+只有 123 字符（能在 WM_CHAR 限制内完整打进去）；完整规则（含 status/context/handoff 三个长路径）
+落在 `zburn-bridge\supervisor-task.txt`，由 `zburn` 每次唤醒前重写。

@@ -803,18 +803,78 @@ def snapshot_agent(cfg: dict, st: State, agent: dict | None = None) -> str:
                                text or "(no visible text)", ""])
 
 
+def supervisor_seed(acfg: dict) -> str:
+    """给「专用监督对话」的开场白（也是这个对话的标题）。
+
+    唤醒词会被打进这个对话，所以标题要一眼能认出来；内容只指路，细节在桥里的 README。
+    """
+    bridge = str(agentlib.bridge_dir(acfg)) if hasattr(agentlib, "bridge_dir") else "zburn-bridge"
+    seed = (f"zburn supervisor channel - read {bridge}\\README.txt and reply READY. "
+            "You will be woken to judge the worker's batch and write handoff.json.")
+    return clamp_prompt(acfg, agentlib.ascii_only(seed))
+
+
+def wake_fingerprint(cfg: dict, st: State, info: dict | None = None) -> str:
+    """worker 有没有新进展：状态 / 上下文尾部 / 待办交接，任何一样变了才值得叫醒。
+
+    没有这个，supervisor 每 10 分钟就被叫起来读一遍巨大上下文、回一句 WAIT，
+    一个会话能堆到 158 轮（实测），纯烧钱。
+    """
+    import hashlib
+    h = hashlib.sha1()
+
+    def feed_bytes(p):
+        try:
+            h.update(pathlib.Path(p).read_bytes())
+        except OSError:
+            h.update(b"-")
+
+    feed_bytes(st.status_path)
+    try:
+        bridge = agentlib.bridge_dir(cfg)
+    except Exception:
+        bridge = None
+    if bridge:
+        feed_bytes(bridge / "context.txt")
+        for name in ("handoff.json", "handoff.txt"):
+            h.update(b"1" if (bridge / name).exists() else b"0")
+    if info:
+        for k in sorted(info):
+            if isinstance(info[k], (str, int, float)):
+                h.update(str(info[k]).encode("utf-8", "ignore"))
+    return h.hexdigest()[:16]
+
+
 def build_supervisor_prompt(cfg: dict, st: State, sup: dict, work: dict | None) -> str:
-    prompt = agentlib.supervisor_prompt(cfg, sup, work)
+    # 完整说明（带三个长路径）写进桥里，真正打进去的唤醒词只指一条路：
+    # WM_CHAR 打不了 480 字符，长指令一定会在半路被截断，
+    # 而截掉的往往正是「这批过了就 new_chat」这种关键句。
+    full = supervisor_full_prompt(cfg, sup, work)
+    try:
+        bridge = agentlib.bridge_dir(cfg)
+        bridge.mkdir(parents=True, exist_ok=True)
+        (bridge / "supervisor-task.txt").write_text(full, encoding="utf-8")
+    except OSError:
+        pass
+    prompt = (f"Read {agentlib.bridge_dir(cfg)}\\supervisor-task.txt and follow it exactly. "
+              "Reply DONE when finished.")
     p = (sup.get("prompt") or {}).get("file")
     if p:
         target = pathlib.Path(p)
         if not target.is_absolute():
             target = st.dir / target
         try:
-            target.write_text(prompt, encoding="utf-8")
+            target.write_text(full, encoding="utf-8")
         except OSError:
             pass
     return prompt
+
+
+def supervisor_full_prompt(cfg: dict, sup: dict, work: dict | None) -> str:
+    """完整的监督说明（用内置长模板，不受 orchestrator.prompt 那行短唤醒词影响）。"""
+    c2 = json.loads(json.dumps(cfg))
+    c2.setdefault("orchestrator", {})["prompt"] = ""
+    return agentlib.supervisor_prompt(c2, sup, work)
 
 
 def write_supervisor_bridge(cfg: dict, st: State, sup: dict, work: dict | None,
@@ -859,8 +919,10 @@ def supervise_now(cfg: dict, st: State, *, dry_run: bool = False, wait: int = 0)
     info = write_supervisor_bridge(cfg, st, sup, work, prompt)
     if dry_run:
         return 0, f"监督桥已刷新：{info['dir']}（dry-run，未唤醒）"
-    sup_view = agentlib.agent_view(cfg, sup, st)
-    code, summary = feed_clean(sup_view, st, prompt)
+    # 走和 run 循环同一条路径：这样「没变化就不叫醒」「没对话就建专用对话」
+    # 「跑满轮数就换对话」这些策略对手动唤醒同样生效。
+    os.environ["ZBURN_FORCE_WAKE"] = "1"      # 手动触发不被「无变化」挡住
+    code, summary = run_agent_once(cfg, st, sup, cycle=0, remaining=None)
     if code != 0:
         return code, f"唤醒 {sup['name']} 失败：{summary}"
     deadline = time.time() + max(0, wait)
@@ -927,16 +989,62 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
 
     # 2) supervisor：刷新监督桥 → 唤醒它
     if spec["role"] == agentlib.SUPERVISOR and (cfg.get("orchestrator") or {}).get("enabled", True):
+        o = cfg.get("orchestrator") or {}
         _, work = agentlib.orchestrator(cfg)
         work = work or spec
         prompt = build_supervisor_prompt(cfg, st, spec, work)
         info = write_supervisor_bridge(cfg, st, spec, work, prompt, remaining)
+        stt = agentlib.read_state(st, aid) or {}
+
+        # ① worker 没变化就不要叫醒：否则每个周期都白白喂一次越来越大的上下文
+        fp = wake_fingerprint(cfg, st, info)
+        if (o.get("skip_when_idle", True) and fp and fp == stt.get("last_wake_fp")
+                and not os.environ.get("ZBURN_FORCE_WAKE")):
+            st.log(f"[{aid}] 监督：worker 无变化，跳过本轮唤醒")
+            agentlib.update_state(st, aid, last_run=now(), last_action="skip",
+                                  last_result="worker 无变化，跳过唤醒")
+            return 0, "skip:no-change"
+
+        # ② 每小时唤醒次数上限
+        cap = int(o.get("max_wakes_per_hour") or 6)
+        wakes = [t for t in (stt.get("wake_times") or []) if time.time() - float(t) < 3600]
+        if cap > 0 and len(wakes) >= cap:
+            st.log(f"[{aid}] 监督：最近一小时已唤醒 {len(wakes)} 次（上限 {cap}），跳过")
+            agentlib.update_state(st, aid, wake_times=wakes, last_action="skip",
+                                  last_result=f"超过唤醒上限 {cap}/小时")
+            return 0, "skip:rate-limit"
+
+        # ③ 监督对话跑太多轮就换一个（长对话只会越滚越大，压缩追不上）
+        rotate_after = int(acfg["feed"].get("rotate_after_turns") or 0)
+        wakes_on = int(stt.get("wakes_on_target") or 0)
+        if rotate_after > 0 and wakes_on >= rotate_after:
+            c, s = new_chat_once(acfg, st, supervisor_seed(acfg),
+                                  project=acfg["new_chat"].get("project", ""),
+                                  agent_id=aid, force=True)
+            st.log(f"[{aid}] 监督对话已唤醒 {wakes_on} 轮 → 换新对话（{s}）")
+            agentlib.update_state(st, aid, wakes_on_target=0, last_run=now(),
+                                  last_action="new_chat", last_result=s)
+            return (0 if c == 0 else 1), s
+
         code, summary = feed_clean(acfg, st, prompt, dry_run=dry_run)
         st.log(f"[{aid}] 监督唤醒：{summary}")
         agentlib.update_state(st, aid, last_run=now(), last_action="supervise",
                               last_result=summary, last_feed=now() if code == 0 else "")
-        if code == 3:
-            st.log(f"[{aid}] 监督会话没配置：在 agents 里给 {aid} 设 feed.targets（dsh 里那个监督对话的标题）")
+        if code == 0:
+            agentlib.update_state(st, aid, last_wake_fp=fp,
+                                  wake_times=(wakes + [time.time()])[-20:],
+                                  wakes_on_target=wakes_on + 1)
+        # 没配目标 / 目标对话不见了（标题改了、被关掉）→ 建一个专用监督对话，
+        # 别再往「随便一个会话」里灌（实测会把工作对话刷成 158 轮 WAIT）
+        if code == 3 or "侧栏没找到" in str(summary) or "候选会话 0 个" in str(summary):
+            st.log(f"[{aid}] 没有可用的监督对话 → 新建专用监督对话")
+            c2, s2 = new_chat_once(acfg, st, supervisor_seed(acfg),
+                                   project=acfg["new_chat"].get("project", ""),
+                                   agent_id=aid, force=True)
+            st.log(f"[{aid}] 新建监督对话：{s2}")
+            agentlib.update_state(st, aid, wakes_on_target=0, last_result=s2,
+                                  last_action="new_chat")
+            return (0 if c2 == 0 else 1), s2
         return (0 if code in (0, 3) else 1), summary
 
     # 3) worker：普通续派（跑够轮数就换新对话，别把上下文喂成天文数字）
@@ -1921,5 +2029,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
 
 
