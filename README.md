@@ -291,6 +291,8 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 | `agents[].model.want` | 如 `zcode2api` | 模型写 `auto` 会按账号池自动路由，可能一直用某几个号、把别的号的额度留着不用。**新对话不继承上次选的模型**，所以每次新建/轮换后都会复查 |
 | `model.enforce` | **开** | 模型没钉住时这一轮不投喂（日志 `skip:model`）。停一分钟比烧错一整夜划算 |
 | `quota.stop_below` | 见配置 | 到阈值自动收工，别把最后一个号也烧空 |
+| `window` | 关 | 只在 `23:00`-`09:00` 这类时段干活（支持跨午夜）。时段外 `run` 显示「暂停中 / 下次几点开始」，进段自动继续 |
+| `quota.stop_action` | `exit` | `wait` = 额度不够时原地等，够了自动继续（夜里额度按天重置时用这个） |
 
 看是不是在空转：
 

@@ -434,7 +434,33 @@ def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token:
             self.end_headers()
             self.wfile.write(body)
 
+        def _guard(self, fn):
+            """兜住处理函数里的异常：返回 500 + 原因，并把 traceback 写进日志。
+
+            没有这层，处理函数一抛异常浏览器/curl 只会看到「连接被重置」，
+            按钮点了没反应，日志里也什么都没有——面板最难查的一种故障。
+            """
+            import traceback
+            try:
+                return fn()
+            except Exception as e:                       # noqa: BLE001
+                tb = traceback.format_exc()
+                try:
+                    st.log(f"[panel] 处理 {self.command} {self.path} 出错：{e!r}\n{tb}")
+                except Exception:
+                    pass
+                try:
+                    return self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                except Exception:
+                    return None
+
         def do_GET(self):
+            return self._guard(self._do_GET)
+
+        def do_POST(self):
+            return self._guard(self._do_POST)
+
+        def _do_GET(self):
             u = urlparse(self.path)
             if u.path in ("/", "/index.html"):
                 if not self._authorized():
@@ -474,7 +500,7 @@ def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token:
                 return self._json(200, {"ok": True, "version": VERSION})
             return self._json(404, {"error": "not found"})
 
-        def do_POST(self):
+        def _do_POST(self):
             u = urlparse(self.path)
             if not self._authorized():
                 return self._json(401, {"error": "unauthorized"})
@@ -607,7 +633,10 @@ def make_handler(cfg: dict, st, sup: Supervisor, config_path: str | None, token:
                 return self._json(200, {"ok": code == 0, "msg": msg, "agent": spec["id"]})
             if u.path == "/api/handoff":
                 act = str(body.get("action") or "feed")
-                sup, work = zburn.agentlib.orchestrator(cfg)
+                # 注意别写成 sup, work = ...：这会让 sup 变成 _do_POST 的局部变量，
+                # 上面的 sup.start() / sup.stop() 立刻变成 UnboundLocalError，
+                # 面板「启动/停止」按钮就整个失效（而且报错还是「连接被重置」）。
+                sup_spec, work = zburn.agentlib.orchestrator(cfg)
                 default_agent = work["id"] if work else ""
                 if act == "clear":
                     n = zburn.agentlib.clear_handoff(cfg, st)

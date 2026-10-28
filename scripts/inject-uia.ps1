@@ -130,9 +130,10 @@ function Find-SendButton($items, $composer) {
             $_.Name -notmatch $ExcludeButtonRegex
         })
     if ($cands.Count -eq 0 -or -not $composer) { return $null }
-    $near = @($cands | Where-Object { ($_.X -ge $composer.X + $composer.W * 0.5) -or ($_.Y -ge $composer.Y) })
-    if ($near.Count -gt 0) { return ($near | Sort-Object X -Descending | Select-Object -First 1) }
-    return ($cands | Sort-Object X -Descending | Select-Object -First 1)
+    # 就近取：离输入框右下角最近的那个。按 X 倒序会点到内置浏览器面板里的发送按钮。
+    $cRight = $composer.X + $composer.W
+    return ($cands | Sort-Object { [Math]::Abs($_.X - $cRight) + [Math]::Abs($_.Y - $composer.Y) } |
+        Select-Object -First 1)
 }
 
 $items = Get-Controls $MaxDepth

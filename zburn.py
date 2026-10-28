@@ -645,12 +645,20 @@ def flush_composer(cfg: dict) -> None:
 
 
 def feed_clean(cfg: dict, st: State, prompt: str, dry_run: bool = False) -> tuple[int, str]:
-    """投喂的稳妥版：先腾空、失败再腾空重投一次。"""
+    """投喂的稳妥版：先腾空、失败再腾空重投一次。
+
+    「成功」的判据是**这一轮至少有一个会话真的被喂进去了**，而不是「零失败」：
+    监控 3 个会话时，其中一个常年 busy/卡住是常态，为它整轮重投等于把同一条指令
+    往刚开跑的那个会话里再灌一遍（还会把它的上下文推快一倍）。
+    """
     if dry_run:
         return feed_once(cfg, st, prompt, dry_run=True)
     flush_composer(cfg)
     code, summary = feed_once(cfg, st, prompt)
-    if code == 0 and "typed=0" not in str(summary) and "失败 1" not in str(summary):
+    stats = feed_stats(summary)
+    if code in (3, 4, 6):                       # 4=指令非法 3=没指定会话 6=结构性问题：重投也一样
+        return code, summary
+    if code == 0 and ((stats["done"] or 0) >= 1 or (stats["typed"] or 0) > 0):
         return code, summary
     st.log(f"[feed] 首次未成功（{summary}）→ 腾空输入框后重投")
     flush_composer(cfg)
@@ -684,11 +692,17 @@ def feed_stats(summary: str) -> dict:
     """从 feed 的摘要行里解析出结构化结果（打进去多少字 / 是否跳过 / 是否失败）。"""
     s = summary or ""
     m = re.search(r"typed=(\d+)", s) or re.search(r"已投喂\s*(\d+)\s*字符", s)
+    total = re.search(r"汇总：投喂\s*(\d+)\s*/\s*跳过\s*(\d+)\s*/\s*失败\s*(\d+)", s)
     return {
         "typed": int(m.group(1)) if m else None,
         "busy": "busy=True" in s,
         "fed": "已投喂" in s,
         "failed": "失败" in s or "投喂失败" in s,
+        # 三个计数：只要「投喂」≥1 就说明这一轮真的推进了，
+        # 哪怕另有一个会话因为忙/卡住失败——不该为它把整轮重投一遍。
+        "done": int(total.group(1)) if total else None,
+        "skipped": int(total.group(2)) if total else None,
+        "failed_n": int(total.group(3)) if total else None,
     }
 
 

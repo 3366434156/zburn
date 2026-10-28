@@ -321,12 +321,18 @@ foreach ($t in $tasks) {
     Start-Sleep -Milliseconds 500
     $typed = (& $len) - 1 - $baseLen
 
+    # 选「离输入框最近」的那个发送按钮：ZCode 的内置浏览器面板右侧还有一个发送按钮，
+    # 按 X 倒序会点到那个，字打进去了但消息永远发不出去。flush-composer.ps1 用同一套判据。
+    $cRight = $composer.X + $composer.W
     $send = Get-Controls | Where-Object {
             $_.Type -eq 'ControlType.Button' -and $_.Name -match $SendButtonRegex -and
             $_.Name -notmatch $QueuedRegex -and $_.Name -notmatch $BusyRegex
-        } | Sort-Object X -Descending | Select-Object -First 1
+        } | Sort-Object { [Math]::Abs($_.X - $cRight) + [Math]::Abs($_.Y - $composer.Y) } |
+        Select-Object -First 1
     $ok = $false
-    if ($send -and $typed -gt 10) {
+    # 以前这里是 -gt 10：结果 "continue"(8 字符)、"go on"(5) 这类短指令永远发不出去，
+    # 日志里只会看到「投喂失败 typed=8」。只要字真的打进去了就该点发送。
+    if ($send -and $typed -gt 0) {
         try {
             $send.El.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
             Start-Sleep -Milliseconds 800
