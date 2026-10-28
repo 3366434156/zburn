@@ -361,8 +361,17 @@ foreach ($t in $tasks) {
     if ($send -and $typed -gt 0) {
         try {
             $send.El.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-            Start-Sleep -Milliseconds 800
-            $ok = ((& $len) - 1 -le $baseLen)
+            # 成功判据两种都算：①输入框被清空 ②「停止生成」按钮出现（它已经在答了）。
+            # 长指令清空是有延迟的（实测 148 字符时 800ms 远远不够），
+            # 只等一次会把「其实发出去了」误判成失败，接着重投一遍 → 灌进正在生成的对话。
+            for ($w = 0; $w -lt 8 -and -not $ok; $w++) {
+                Start-Sleep -Milliseconds 500
+                if ((& $len) - 1 -le $baseLen) { $ok = $true; break }
+                $items2 = Get-Controls
+                if (@($items2 | Where-Object {
+                            $_.Type -eq 'ControlType.Button' -and $_.Name -match $BusyRegex
+                        }).Count -gt 0) { $ok = $true }
+            }
         } catch { }
     }
     if ($ok) { Write-Output ("  [$label] 已投喂 {0} 字符" -f $typed); $done++ }
