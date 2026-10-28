@@ -2258,7 +2258,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="zburn", description="熄屏守护：锁屏下持续驱动桌面 AI")
     ap.add_argument("-V", "--version", action="version", version=f"zburn {VERSION}")
     ap.add_argument("--config", default=os.environ.get("ZBURN_CONFIG"),
-                    help="配置文件路径（默认环境变量 ZBURN_CONFIG，或内置默认值）")
+                    help="配置文件路径（不给就依次找 当前目录/config.json、脚本目录/config.json、"
+                         "%%LOCALAPPDATA%%\\zburn\\config.json）")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", help="环境自检").set_defaults(func=cmd_doctor)
