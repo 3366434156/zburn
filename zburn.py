@@ -1748,7 +1748,7 @@ def cmd_model(a) -> int:
         if not want:
             print("要用 --set 得先给 --want（例如 --want zcode2api）")
             return 2
-        code, out, err = run_ps("pick-model2.ps1",
+        code, out, err = run_ps("pick-model.ps1",
                                 {"ProcessName": acfg["app"]["process_name"], "Wanted": want},
                                 timeout=180)
         for ln in (out or "").splitlines()[-4:]:
@@ -1921,4 +1921,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 

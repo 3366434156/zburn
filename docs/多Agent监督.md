@@ -183,3 +183,15 @@ python zburn.py newchat --config config.json --agent zcode --project zburn --pro
   唯一可靠的腾空办法是**把残留当一条普通消息发出去**（`scripts/flush-composer.ps1`）。
   `batch` 投喂失败会自动调它重试；`new-chat.ps1 -ClearResidual` 也走这条路，
   所以残留不会再堵死新对话。
+
+## 7. 别让额度白烧（2026-10-28 实测血泪）
+
+* **指令上限**：`prompt.max_chars`（默认 180）。WM_CHAR 打长了会丢字，长指令写进文件让模型读。
+  实测夜里 400 字符的指令只打进去 300 多，剩下的被吞，然后 flush 又把半截当消息发出去。
+* **对话轮换**：`feed.rotate_after_turns`（默认 3）。一个对话续太多轮，上下文越滚越大，
+  每轮都要重发整段历史 —— 这是最隐形的烧钱方式。跑满就 `new_chat`。
+* **模型钉死**：`agents[].model.want`（如 `zcode2api`） + `zburn model --want zcode2api`。
+  ZCode 里显示 `magpie/auto/…` 时，`auto` 会自己挑账号池，可能把某几个号打空、
+  另一个号的额度一分没动（实测：一个号 500 万整桶未使用）。
+* **看速率**：`zburn status` 第一行会打印「近一小时掉多少 / 约多少 tokens 每小时」，
+  速率高但任务没推进 = 空转，先降频（`interval_seconds` 300）再看。
