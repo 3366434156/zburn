@@ -256,6 +256,7 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 | `doctor` | 环境自检（应用/无障碍树/锁屏状态/网关/额度/模板） |
 | `quota [--refresh]` | 读一次额度 |
 | `accounts [--refresh] [--json]` | 按账号看额度明细：哪个号还剩、哪个烧完了、哪个还没刷过 |
+| `queue [--next] [--list N] [--reset]` | 看任务队列派活进度、预览下一条会投喂什么、清进度 |
 | `status [--follow]` | 看 status.json、心跳、最近日志 |
 | `probe [--filter] [--json]` | 导出目标窗口无障碍树（换应用第一件事） |
 | `inject --text "…" [--dry-run] [--no-enter]` | 直接往输入框投一条 |
@@ -275,6 +276,7 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 | `gateway` | 只探活，必要时按配置拉起网关（绝不重启） |
 | `token` | 生成面板 token |
 | `model [--agent id] [--want zcode2api] [--set]` | 看/校验/切换当前对话的模型（`auto` 路由会白烧额度，建议钉死） |
+| `model --pin-sessions [--dry-run]` | **按会话**钉模型：ZCode 的模型跟会话走，后台会话可能一直跑在 `auto/` 上（界面上那个按钮只代表当前打开的那个对话）。这个命令把「名单 ∪ 正则」能喂到的会话逐个切过去、钉回 `model.want`，钉好的不碰 |
 | `batch --queue q.json` | 队列驱动：投喂 → 等文件改动 → 跑验收命令 → 记账（失败重试、断点续跑） |
 | `autopilot --queue q.json --target …` | 夜间总控：分片并发 + 进程自愈 + 应用/网关自愈 |
 | `plugin install\|remove` | 安装/卸载自动继续插件 |
@@ -290,7 +292,9 @@ pwsh -File scripts/probe-edits.ps1 -ProcessName Notepad
 | `feed.compact_at_tokens` | **300000** | 上下文压缩闸门：被监控会话滚过 30 万 token 就先投 `/compact` 压回去，压完自动恢复续派。轮换兜不住的老会话（「新建任务」按钮滚出可视区、正则一直命中旧对话）实测能滚到 **88 万 token——这时一句 `continue` 就是 88 万 input token**；上下文从 ZCode 会话库读（和界面「上下文容量」同源），库读不到时闸门自动失效、照常投喂 |
 | `feed.interval_seconds` | 120（建议 300） | 每轮都要重发整段历史，喂得越密烧得越快；忙的时候本来就会跳过 |
 | `agents[].model.want` | 如 `zcode2api` | 模型写 `auto` 会按账号池自动路由，可能一直用某几个号、把别的号的额度留着不用。**新对话不继承上次选的模型**，所以每次新建/轮换后都会复查 |
-| `model.enforce` | **开** | 模型没钉住时这一轮不投喂（日志 `skip:model`）。停一分钟比烧错一整夜划算 |
+| `model.enforce` | **开** | 模型没钉住时这一轮不投喂（日志 `skip:model`）。停一分钟比烧错一整夜划算。**按会话判定**：模型是跟会话走的，界面上那个按钮只代表当前打开的那个对话——被投喂的后台会话实际跑在 `auto/` 上时，看按钮永远看不出来（实测 6 个被监控会话里 3 个在 auto 上，其中一个滚到 93 万 token 还在被喂 `continue`）。现在每轮从会话库 `model_usage.model_id` 逐会话核对，跑偏的那几个不喂也不压，用 `zburn model --pin-sessions` 钉回来 |
+| `model.on_mismatch` | `stop` | **只认一个模型**：检测到别的模型（界面按钮或会话库里任一处不对）→ 先尝试切回；切不动就立刻停整条链（退出码 3，`status.state=error, reason=model`），不再「跳过这一轮继续跑」 |
+| `queue` | 关 | 开了就按队列逐条派活（每条带题材 + 验收命令），不再喂 `continue`。**空指令是跑题的根源**：模型只会自己挑题材，越挑越像文玩静物 |
 | `quota.stop_below` | 见配置 | 到阈值自动收工，别把最后一个号也烧空 |
 | `window` | 关 | 只在 `23:00`-`09:00` 这类时段干活（支持跨午夜）。时段外 `run` 显示「暂停中 / 下次几点开始」，进段自动继续 |
 | `quota.stop_action` | `exit` | `wait` = 额度不够时原地等，够了自动继续（夜里额度按天重置时用这个） |

@@ -121,6 +121,9 @@ DEFAULT_CONFIG = {
     "paths": {"state_dir": ".zburn", "stop_file": "STOP", "bridge_dir": ""},
     # 只在这个时段干活（跨午夜也认：23:00-09:00）。没开=全天。
     "window": {"enabled": False, "start": "23:00", "end": "09:00"},
+    # 任务队列：开了就按队列里的题材逐条派活，不再喂「continue」
+    # （空指令 = 模型自由发挥 = 跑题，这是连续几晚变文玩展的根因）
+    "queue": {"enabled": False, "path": "", "only_group": ""},
     "watchdog": {"heartbeat_stale_seconds": 420, "check_seconds": 30},
     "panel": {"host": "127.0.0.1", "port": 8790, "token": "", "autostart": False},
     # 多 agent：空列表 = 沿用上面 app/uia/feed/prompt 的单应用行为。
@@ -495,6 +498,116 @@ def _sum_remaining(obj) -> int | None:
     return total
 
 
+# ---------------------------------------------------------------- 任务队列
+def queue_conf(cfg: dict) -> dict:
+    return cfg.get("queue") or {}
+
+
+def queue_path(cfg: dict) -> pathlib.Path | None:
+    p = str(queue_conf(cfg).get("path") or "").strip()
+    return pathlib.Path(p) if p else None
+
+
+def queue_done_file(st: State) -> pathlib.Path:
+    return st.dir / "queue_done.json"
+
+
+def queue_load_done(st: State) -> dict:
+    try:
+        return json.loads(queue_done_file(st).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def queue_save_done(st: State, done: dict) -> None:
+    try:
+        queue_done_file(st).write_text(json.dumps(done, ensure_ascii=False, indent=1),
+                                       encoding="utf-8")
+    except OSError:
+        pass
+
+
+def queue_tasks(cfg: dict) -> list[dict]:
+    p = queue_path(cfg)
+    if not p or not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return []
+    tasks = data.get("tasks") if isinstance(data, dict) else data
+    return [t for t in (tasks or []) if isinstance(t, dict) and t.get("id")]
+
+
+def queue_next(cfg: dict, st: State) -> dict | None:
+    """下一个还没派过的任务；队列关掉/读完返回 None（那就回退到普通续派）。"""
+    q = queue_conf(cfg)
+    if not q.get("enabled"):
+        return None
+    done = queue_load_done(st)
+    only = str(q.get("only_group") or "")
+    for t in queue_tasks(cfg):
+        if str(t["id"]) in done:
+            continue
+        if only and only not in str(t.get("group") or ""):
+            continue
+        return t
+    return None
+
+
+def queue_mark(cfg: dict, st: State, task_id: str, note: str = "") -> None:
+    done = queue_load_done(st)
+    done[str(task_id)] = note or now()
+    queue_save_done(st, done)
+
+
+def queue_prompt(cfg: dict, st: State, task: dict) -> str:
+    """把任务书写进桥目录（纯 ASCII 路径），指令只指路。
+
+    「continue」这种空指令是跑题的根源：模型只能自己挑题材，越挑越像文玩静物。
+    队列里每条任务都带题材、要素和验收命令，让它照着改，就不会自由发挥。
+    """
+    tid = str(task["id"])
+    d = agentlib.bridge_dir(cfg) / "tasks"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{tid}.txt"
+    lines = []
+    if task.get("group"):
+        lines.append(f"# group: {task['group']}")
+    lines.append(str(task.get("prompt") or "").strip())
+    if task.get("verify"):
+        lines.append("")
+        lines.append("Verify with: " + str(task["verify"]))
+    f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    text = (f"Read {f} and follow it exactly. "
+            f"Reply DONE when effects/{tid}.frag passes the gate.")
+    return clamp_prompt(cfg, text, st)
+
+
+def next_prompt(cfg: dict, st: State, cycle: int, remaining: int | None) -> tuple[str, dict | None]:
+    """有队列就派队列任务，没有就退回模板续派。"""
+    task = queue_next(cfg, st)
+    if task:
+        return queue_prompt(cfg, st, task), task
+    return build_prompt(cfg, st, cycle, remaining), None
+
+
+def feed_next(cfg: dict, st: State, cycle: int, remaining: int | None, *,
+              only_targets: list[str] | None = None, dry_run: bool = False) -> tuple[int, str, dict | None]:
+    """投喂「下一步」：先从队列取任务，队列空了才用模板。成功的队列任务记账。"""
+    prompt, task = next_prompt(cfg, st, cycle, remaining)
+    if only_targets:
+        code, summary = feed_clean(cfg, st, prompt, only_targets=only_targets)
+    else:
+        code, summary = feed_clean(cfg, st, prompt, dry_run=dry_run)
+    if task and code == 0 and not dry_run:
+        stats = feed_stats(summary)
+        if (stats["done"] or 0) >= 1 or (stats["typed"] or 0) > 0:
+            queue_mark(cfg, st, task["id"], f"fed {now()}")
+            st.log(f"[queue] 已派 {task['id']}（{task.get('group', '')}）")
+    return code, summary, task
+
+
 # ---------------------------------------------------------------- 允许时段
 def _hhmm_minutes(text, default: int) -> int:
     """'23:00' → 1380。写错就退回默认值（宁可跑错时段，也别因为一行配置不干活）。"""
@@ -774,20 +887,21 @@ def inject_once(cfg: dict, st: State, text: str, no_enter: bool = False, dry_run
     return code
 
 
-# ---------------------------------------------------------------- 上下文压缩闸门
-def compact_gate(cfg: dict, st: State) -> tuple[list[dict], list[dict], str] | None:
-    """上下文压缩闸门：被监控会话里谁已滚过阈值、谁还健康。
+# ---------------------------------------------------------------- 会话状态闸门
+def compact_gate(cfg: dict, st: State, want: str = "") -> dict | None:
+    """被监控会话的真实状态：上下文大小、是否在压缩、实际跑在哪个模型上。
 
-    返回 (over, under, note)：
-      over  = 上下文 ≥ feed.compact_at_tokens 且不在压缩中的会话（该投 /compact）
-      under = 上下文还在阈值内的会话（可以照常续派）
-    返回 None = 闸门不可用（没开阈值 / 没配筛选 / 读不到会话库 / 名单没匹配上），
-    调用方按原流程投喂 —— 闸门失明时宁可多喂一句，也不能把整个守护停摆。
+    返回 {"over", "under", "compacting", "offpin", "note"}：
+      over     = 上下文 ≥ feed.compact_at_tokens 且不在压缩中（该投 compact_command）
+      under    = 上下文还在阈值内的（可以照常续派）
+      offpin   = 实际模型不含 model.want 的会话。auto/... 就是这种：网关自己挑桶，
+                 额度烧在别的模型上。只读界面上「当前打开那个对话」的模型按钮
+                 完全看不见它们 —— 实测 6 个被监控会话里 3 个在 auto/ 上，
+                 其中一个滚到 93 万 token 还在被每 2 分钟喂一次 continue。
+    返回 None = 读不到（没配筛选 / 会话库打不开 / 名单没匹配上），按原流程投喂。
     """
     feed = cfg.get("feed") or {}
     thr = int(feed.get("compact_at_tokens") or 0)
-    if thr <= 0:
-        return None
     targets = feed_targets(cfg)
     regex = (cfg["uia"].get("session_regex") or "").strip()
     if not targets and not regex:
@@ -797,20 +911,36 @@ def compact_gate(cfg: dict, st: State) -> tuple[list[dict], list[dict], str] | N
     except Exception:
         sessions = None
     if not sessions:
-        st.log("[compact] 闸门不可用（会话库读不到或监控名单没匹配上），本轮按原流程投喂")
+        st.log("[gate] 会话库读不到或监控名单没匹配上，本轮按原流程投喂")
         return None
-    over = [s for s in sessions if s["context_tokens"] >= thr and not s["compacting"]]
+
+    def _offpin(s: dict) -> bool:
+        model = str(s.get("model") or "")
+        return bool(want and model and want not in model)
+
+    offpin = [s for s in sessions if _offpin(s)]
+    pinned = [s for s in sessions if not _offpin(s)]
     # 正在压缩的会话两头都不进：再投 /compact 只会排队，投 continue 会把刚压完的又灌胖
-    compacting = sum(1 for s in sessions if s["compacting"] and s["context_tokens"] >= thr)
-    under = [s for s in sessions if s["context_tokens"] < thr]
+    over = [s for s in pinned if thr > 0 and s["context_tokens"] >= thr and not s["compacting"]]
+    compacting = [s for s in pinned if thr > 0 and s["context_tokens"] >= thr and s["compacting"]]
+    under = [s for s in pinned if thr <= 0 or s["context_tokens"] < thr]
 
     def _tag(s: dict) -> str:
         t = s["title"] or s["id"]
-        return f"{t[:36]}{'…' if len(t) > 36 else ''}={s['context_tokens'] // 1000}k"
+        return (f"{t[:30]}{'…' if len(t) > 30 else ''}={s['context_tokens'] // 1000}k"
+                + ("/auto" if _offpin(s) else ""))
 
-    note = (f"阈值 {thr // 1000}k：超限 [{'、'.join(_tag(s) for s in over) or '无'}]"
-            f" 压缩中 {compacting} 个 健康 {len(under)} 个")
-    return over, under, note
+    bits = []
+    if thr > 0:
+        bits.append(f"阈值 {thr // 1000}k")
+    bits.append(f"超限 [{'、'.join(_tag(s) for s in over) or '无'}]")
+    if compacting:
+        bits.append(f"压缩中 {len(compacting)}")
+    bits.append(f"健康 {len(under)}")
+    if offpin:
+        bits.append(f"⚠ 不在 {want} 上（额度会烧到 auto 桶）：[{'、'.join(_tag(s) for s in offpin)}]")
+    return {"over": over, "under": under, "compacting": compacting,
+            "offpin": offpin, "note": " ".join(bits)}
 
 
 # ---------------------------------------------------------------- 多 agent / 交接
@@ -1097,7 +1227,34 @@ def supervisor_full_prompt(cfg: dict, sup: dict, work: dict | None) -> str:
     """完整的监督说明（用内置长模板，不受 orchestrator.prompt 那行短唤醒词影响）。"""
     c2 = json.loads(json.dumps(cfg))
     c2.setdefault("orchestrator", {})["prompt"] = ""
-    return agentlib.supervisor_prompt(c2, sup, work)
+    base = agentlib.supervisor_prompt(c2, sup, work)
+    # 队列在跑时，把「当前该做哪条、怎么验收」写进任务书：
+    # 监督者要能一眼看出 worker 是在照队列干活，还是在自由发挥跑题。
+    q = queue_conf(cfg)
+    if q.get("enabled"):
+        tasks = queue_tasks(cfg)
+        done = {}
+        try:
+            done = json.loads((pathlib.Path(cfg["paths"]["state_dir"]) /
+                               "queue_done.json").read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        nxt = next((t for t in tasks if str(t["id"]) not in done), None)
+        qp = queue_path(cfg)
+        lines = ["", "## queue",
+                 f"queue={qp}  tasks={len(tasks)} dispatched={len(done)}"]
+        if nxt:
+            lines.append(f"next={nxt['id']} group={nxt.get('group', '')}")
+            lines.append(f"verify: python fxgate.py {nxt['id']} --render")
+        lines += [
+            "RULE: this project makes 修仙/玄幻 effects (功法施放、法器、天象、灵兽、法阵).",
+            "Anything that is a static object study (玉佩/香囊/玛瑙/紫砂壶/核舟/棋盘/扇骨"
+            "/印章…) is OFF-THEME even if it passes lint.",
+            "If the worker produced an off-theme still-life, write a handoff telling it to redo"
+            " that stem with a real spell/artifact/sky effect (light beams, shockwave, particles).",
+        ]
+        base = base.rstrip() + "\n" + "\n".join(lines) + "\n"
+    return base
 
 
 def write_supervisor_bridge(cfg: dict, st: State, sup: dict, work: dict | None,
@@ -1117,7 +1274,7 @@ def write_supervisor_bridge(cfg: dict, st: State, sup: dict, work: dict | None,
                                  supervisor_name=sup.get("name", ""))
 
 
-def open_session(cfg: dict) -> tuple[int, str]:
+def open_session(cfg: dict, target: str = "") -> tuple[int, str]:
     """把聊天窗口里的一个对话点开（不投喂），让输入框出现。
 
     应用被强杀/崩溃重启后，ZCode 常常停在「一个对话都没打开」的空状态：侧栏和按钮
@@ -1129,7 +1286,7 @@ def open_session(cfg: dict) -> tuple[int, str]:
         "ProcessName": cfg["app"]["process_name"],
         "WindowTitleRegex": cfg["uia"].get("window_title_regex", ""),
         "SessionRegex": cfg["uia"].get("session_regex", "") or ".",
-        "Targets": json.dumps(feed_targets(cfg), ensure_ascii=False),
+        "Targets": json.dumps([target] if target else feed_targets(cfg), ensure_ascii=False),
         "BusyRegex": cfg["uia"]["busy_regex"],
         "QueuedRegex": cfg["uia"]["queued_regex"],
         "MaxSessions": 1,
@@ -1142,6 +1299,25 @@ def open_session(cfg: dict) -> tuple[int, str]:
         return 1, f"{type(e).__name__}: {e}"
     lines = [ln.strip() for ln in (out or "").strip().splitlines() if ln.strip()]
     return code, (lines[-1] if lines else (err or "").strip()[:160] or f"exit {code}")
+
+
+def repin_sessions(cfg: dict, st: State, agent_id: str, sessions: list[dict],
+                   want: str) -> tuple[bool, str]:
+    """逐个点开跑错模型的会话、把模型切回 want。全成功才算成功（需要解锁桌面）。"""
+    bad: list[str] = []
+    for s in sessions:
+        title = str(s.get("matched") or s.get("title") or "")
+        if not title:
+            bad.append("(没有标题)")
+            continue
+        code, msg = open_session(cfg, target=title)
+        if code != 0:
+            bad.append(f"{title[:16]}(点不开：{msg[:40]})")
+            continue
+        ok, m = model_guard(cfg, st, agent_id, auto=True)
+        if ok is not True:
+            bad.append(f"{title[:16]}({m[:40]})")
+    return (not bad), "；".join(bad)
 
 
 def apply_handoff(cfg: dict, st: State, rec: dict, worker: dict | None = None) -> dict | None:
@@ -1172,7 +1348,10 @@ def supervise_now(cfg: dict, st: State, *, dry_run: bool = False, wait: int = 0)
     # 走和 run 循环同一条路径：这样「没变化就不叫醒」「没对话就建专用对话」
     # 「跑满轮数就换对话」这些策略对手动唤醒同样生效。
     os.environ["ZBURN_FORCE_WAKE"] = "1"      # 手动触发不被「无变化」挡住
-    code, summary = run_agent_once(cfg, st, sup, cycle=0, remaining=None)
+    try:
+        code, summary = run_agent_once(cfg, st, sup, cycle=0, remaining=None)
+    except ModelViolation as e:
+        return 3, f"模型不对且切不回来，已停止：{e}"
     if code != 0:
         return code, f"唤醒 {sup['name']} 失败：{summary}"
     deadline = time.time() + max(0, wait)
@@ -1347,11 +1526,14 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
         if stt.get("model_ok") is False or turns % every == 0:
             ok, mmsg = model_guard(acfg, st, aid)
             if ok is False and m.get("enforce", True):
-                st.log(f"[{aid}] 模型不对（{mmsg}）→ 本轮不投喂"
-                       "：先把模型钉回去，否则额度会烧到别的模型上")
-                agentlib.update_state(st, aid, last_run=now(), last_action="skip",
-                                      last_result=f"model: {mmsg}")
-                return 0, f"skip:model {mmsg}"
+                if str(m.get("on_mismatch") or "stop").lower() == "skip":
+                    st.log(f"[{aid}] 模型不对（{mmsg}）→ 本轮不投喂"
+                           "：先把模型钉回去，否则额度会烧到别的模型上")
+                    agentlib.update_state(st, aid, last_run=now(), last_action="skip",
+                                          last_result=f"model: {mmsg}")
+                    return 0, f"skip:model {mmsg}"
+                # 默认：直接停。切过了（model_guard 里 auto_pin 已经试过），切不回来就别继续烧
+                raise ModelViolation(f"[{aid}] {mmsg}")
 
     if rotate_after > 0 and turns >= rotate_after:
         seed = pathlib.Path(acfg["prompt"].get("file") or "next-prompt.txt")
@@ -1376,34 +1558,67 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
         # 落到下面的压缩闸门/续派继续推进，下一轮还会再试换新。
         st.log(f"[{aid}] 已跑满 {turns} 轮但换新对话失败（{summary}）→ 本轮改走压缩/续派")
 
-    # 3b) 压缩闸门：有会话滚过阈值就先把它压回去，而不是继续灌 continue。
-    #     超限会话每续一句都要把几十万 token 的历史整段重发（实测 88 万 token 的
-    #     会话一句 continue ≈ 88 万 input token），轮换兜不住的老会话就是在这
-    #     把额度烧穿的。读不到会话库时闸门返回 None，一切照旧。
-    gate = compact_gate(acfg, st)
+    # 3b) 会话闸门：按会话看真实状态（上下文 / 是否在压缩 / 实际模型）。
+    #     上下文：超限会话每续一句都要把几十万 token 的历史整段重发（实测 88 万
+    #     token 的会话一句 continue ≈ 88 万 input token），轮换兜不住的老会话就是
+    #     在这把额度烧穿的。
+    #     模型：ZCode 的模型跟会话走，新对话默认落 `auto/...`，而 model_guard 只读
+    #     界面上「当前打开那个对话」的按钮 —— 后台会话跑在 auto 上烧额度它看不见。
+    #     所以这里按会话库里的实际 model_id 再挡一道（model.enforce 控制是否停喂）。
+    #     读不到会话库时闸门返回 None，一切照旧。
+    gate = compact_gate(acfg, st, want)
     if gate is not None:
-        over, under, note = gate
-        if not over:
-            pass                                   # 全部健康：闸门只看不动
+        offpin, under, note = gate["offpin"], gate["under"], gate["note"]
+        over = gate["over"]
+        enforce = bool((acfg.get("model") or {}).get("enforce", True))
+        if offpin and enforce:
+            on_mismatch = str((acfg.get("model") or {}).get("on_mismatch") or "stop").lower()
+            st.log(f"[{aid}] ⚠ {len(offpin)} 个会话不在 '{want}' 上：{note}")
+            fixed, detail = False, ""
+            if not dry_run:
+                fixed, detail = repin_sessions(acfg, st, aid, offpin, want)
+                st.log(f"[{aid}] 试着把它们切回 '{want}'："
+                       + ("全部成功" if fixed else f"仍有失败（{detail}）"))
+                if fixed:
+                    gate = compact_gate(acfg, st, want) or gate
+                    offpin, under, over = gate["offpin"], gate["under"], gate["over"]
+            if not fixed:
+                if on_mismatch == "skip":
+                    agentlib.update_state(st, aid, last_run=now(), last_action="skip",
+                                          last_result=f"skip:model {note}")
+                    if not under and not over:
+                        return 0, f"skip:model {note}"
+                else:
+                    # 默认：直接停。切过了，切不动就不烧了
+                    raise ModelViolation(f"[{aid}] {len(offpin)} 个会话不在 '{want}' 上：{note}")
+        elif offpin:
+            st.log(f"[{aid}] ⚠ 会话不在 '{want}' 上（enforce=false，照喂）：{note}")
+
+        if not over and not (offpin and enforce and under):
+            pass                                   # 没有要压的：闸门只看不动
         elif dry_run:
-            st.log(f"[{aid}] 压缩闸门（dry-run）：{note}")
+            st.log(f"[{aid}] 会话闸门（dry-run）：{note}")
         else:
             cmd = str(acfg["feed"].get("compact_command") or "/compact").strip() or "/compact"
             for sess in over[:2]:                  # 一轮最多点两个：投喂是逐字打的
                 c, s = feed_clean(acfg, st, cmd,
                                   only_targets=[sess.get("matched") or sess["title"]])
                 st.log(f"[{aid}] 上下文 {sess['context_tokens']:,} ≥ 阈值 → 投 {cmd}：{s}")
-            agentlib.update_state(st, aid, last_run=now(), last_action="compact",
-                                  last_result=note)
+            if over:
+                agentlib.update_state(st, aid, last_run=now(), last_action="compact",
+                                      last_result=note)
             if not under:
-                # 全都超限/在压缩：这轮不再喂 continue，等压缩落地，下轮上下文
-                # 掉回阈值内就自动恢复续派
+                # 全都超限/在压缩/跑错模型：这轮不再喂 continue，等压缩落地，
+                # 下轮上下文掉回阈值内就自动恢复续派
                 return 0, f"skip:compact {note}"
-            prompt = build_prompt(acfg, st, cycle, remaining)
+            prompt, _task = next_prompt(acfg, st, cycle, remaining)
             code, summary = feed_clean(acfg, st, prompt,
                                        only_targets=[s.get("matched") or s["title"]
                                                      for s in under])
-            st.log(f"[{aid}] 第 {cycle} 轮投喂（仅健康会话，超限的先压着）：{summary}")
+            st.log(f"[{aid}] 第 {cycle} 轮投喂（仅健康会话，超限/跑错模型的先压着）：{summary}")
+            if _task and code == 0:
+                queue_mark(acfg, st, _task["id"], f"fed {now()}")
+                st.log(f"[queue] 已派 {_task['id']}（{_task.get('group', '')}）")
             stats = feed_stats(summary)
             fed = code == 0 and not stats["failed"] and not stats["busy"]
             agentlib.update_state(st, aid, last_run=now(), last_action="feed",
@@ -1412,9 +1627,12 @@ def run_agent_once(cfg: dict, st: State, spec: dict, cycle: int,
                                   last_feed=now() if fed else "")
             return (0 if code in (0, 3) else 1), summary
 
-    prompt = build_prompt(acfg, st, cycle, remaining)
+    prompt, _task = next_prompt(acfg, st, cycle, remaining)
     code, summary = feed_clean(acfg, st, prompt, dry_run=dry_run)
     st.log(f"[{aid}] 第 {cycle} 轮投喂：{summary}")
+    if _task and code == 0 and not dry_run:
+        queue_mark(acfg, st, _task["id"], f"fed {now()}")
+        st.log(f"[queue] 已派 {_task['id']}（{_task.get('group', '')}）")
     stats = feed_stats(summary)
     fed = code == 0 and not stats["failed"] and not stats["busy"]
     agentlib.update_state(st, aid, last_run=now(), last_action="feed",
@@ -1600,6 +1818,23 @@ def cmd_doctor(a) -> int:
           + (f"被监控会话 ≥ {ct:,} token 时投 {cc} 压回去"
              "（上下文从 ZCode 会话库 model_usage 读；库打不开闸门自动失效）" if ct
              else "未开启（feed.compact_at_tokens=0，会话上下文会一直滚大）"))
+    # 模型是跟会话走的：界面上那个按钮只代表「当前打开的那个对话」，
+    # 被后台投喂的会话有没有跑在 auto/ 上，只有会话库知道。
+    for spec in agentlib.agent_specs(cfg):
+        want = str((spec.get("model") or {}).get("want") or "").strip()
+        if not want:
+            continue
+        acfg = agentlib.agent_view(cfg, spec, st)
+        gate = compact_gate(acfg, st, want)
+        if gate is None:
+            continue
+        off, on = gate["offpin"], gate["under"] + gate["over"] + gate["compacting"]
+        print(f"[{'WARN' if off else 'OK '}] {spec['id']} 会话模型："
+              f"{len(on)} 个在 {want} 上"
+              + (f"，{len(off)} 个不在："
+                 + "、".join(f"{(s.get('matched') or s['title'])[:20]}={s['model']}"
+                             for s in off[:3])
+                 + "（auto 会烧到别的桶；enforce 开着就不喂它们）" if off else ""))
     if window_spec(cfg) is None:
         print("[-- ] 允许时段：不限（全天都会跑）")
     else:
@@ -1908,6 +2143,26 @@ def cmd_run(a) -> int:
     st.log(f"额度源={cfg['quota']['provider']}；STOP 文件={st.stop_file}")
     st.log(f"允许时段={window_desc(cfg)}"
            + ("" if in_window(cfg) else "（现在不在时段内，先等着）"))
+
+    # 只认一个模型：起跑前先确认，不对就先切、切不动直接不启动
+    # （用户要求：检测到其他模型 → 停 → 切 → 还不行就停）
+    if not a.dry_run:
+        for s in agentlib.enabled_agents(cfg):
+            if s["role"] != agentlib.WORKER:
+                continue
+            acfg = agentlib.agent_view(cfg, s, st)
+            want = str((acfg.get("model") or {}).get("want") or "").strip()
+            if not want or not app_running(acfg):
+                continue
+            ok, msg = model_guard(acfg, st, s["id"])
+            if ok is False:
+                st.log(f"[{s['id']}] 起跑前模型不对（{msg}）→ 不启动。"
+                       "解锁桌面后跑 python zburn.py model --set，或先在应用里手选一次")
+                st.status(state="error", reason="model", model=msg)
+                return 3
+            if ok is True:
+                st.log(f"[{s['id']}] 起跑前模型检查：{msg}")
+
     cycle = 0
     fails: dict[str, int] = {}
     last_refresh = 0.0
@@ -2003,7 +2258,14 @@ def cmd_run(a) -> int:
             if due:
                 cycle += 1
                 for s in due:
-                    code, summary = run_agent_once(cfg, st, s, cycle, remaining, a.dry_run)
+                    try:
+                        code, summary = run_agent_once(cfg, st, s, cycle, remaining, a.dry_run)
+                    except ModelViolation as e:
+                        # 只认一个模型：切不回来就整体停下，别让额度继续烧在别的桶里
+                        st.log(f"✗ 模型不对且切不回来 → 停止全部：{e}")
+                        st.status(state="error", reason="model", model=str(e)[:300],
+                                  cycle=cycle, remaining=remaining)
+                        return 3
                     last_run[s["id"]] = time.time()
                     fails[s["id"]] = 0 if code == 0 else fails.get(s["id"], 0) + 1
                     st.status(state="running", cycle=cycle, remaining=remaining, gateway=gw,
@@ -2470,6 +2732,85 @@ def cmd_autopilot(a) -> int:
                          poll=a.poll, max_hours=a.hours)
 
 
+def pin_session_model(cfg: dict, st: State, target: str, want: str,
+                      dry_run: bool = False) -> tuple[bool, str]:
+    """把某个会话切到前台，再把**它自己的**模型钉到 want。
+
+    模型是跟会话走的：界面上那个选择器只改当前打开的对话。所以钉一个后台会话
+    必须先切过去（SwitchOnly，切不过去就失败，不回退到别的对话），切完再选模型
+    并复查按钮文案。
+    """
+    label = (target or "")[:30]
+    if dry_run:
+        return True, f"(dry-run) 会切到 [{label}] 并钉 '{want}'"
+    params = {
+        "ProcessName": cfg["app"]["process_name"],
+        "WindowTitleRegex": cfg["uia"].get("window_title_regex", ""),
+        "SessionRegex": "",
+        "Targets": json.dumps([target], ensure_ascii=False),
+        "BusyRegex": cfg["uia"]["busy_regex"],
+        "QueuedRegex": cfg["uia"]["queued_regex"],
+        "MaxSessions": 1,
+        "MaxDepth": cfg["uia"]["max_depth"],
+        "SwitchOnly": True,
+    }
+    code, out, err = run_ps("feed-sessions.ps1", params, timeout=180)
+    if code != 0:
+        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        note = (lines[-1] if lines else "") or (err or "").strip()[:160] or f"exit {code}"
+        return False, f"切不过去（{note}）"
+    if desktop_locked():
+        return False, "已切到该会话，但锁屏中点不动模型下拉（解锁后再跑一次）"
+    run_ps("pick-model.ps1", {"ProcessName": cfg["app"]["process_name"], "Wanted": want},
+           timeout=180)
+    cur = probe_model(cfg)
+    return (want in cur), (cur or "读不到模型按钮")
+
+
+def pin_offpin_sessions(cfg: dict, st: State, want: str, *,
+                        dry_run: bool = False) -> tuple[int, str]:
+    """把「以后可能被喂到的会话」里跑在 auto/ 等别的模型上的，逐个切过去钉回 want。
+
+    这里取「监控名单 ∪ 会话正则」的并集：投喂只认名单，但名单一空就会退回正则，
+    那时以前被正则捞到的老会话又会开始吃 continue —— 它们要是还在 auto 上，
+    额度照样烧错桶。
+    """
+    targets = feed_targets(cfg)
+    regex = (cfg["uia"].get("session_regex") or "").strip()
+    if not targets and not regex:
+        return 3, "没配监控名单也没配会话正则，不知道要钉哪些会话"
+    try:
+        sessions = zsession.session_contexts(cfg, targets=targets,
+                                             session_regex=regex, union=True)
+    except Exception:
+        sessions = None
+    if not sessions:
+        return 3, "读不到会话库或名单一条都没匹配上，无法判断哪些会话跑偏了"
+    off = [s for s in sessions if s.get("model") and want not in s["model"]]
+    if not off:
+        return 0, f"所有可能被喂的会话都在 '{want}' 上（共 {len(sessions)} 个）"
+    ok_n = 0
+    for s in off:
+        target = s.get("matched") or s["title"]
+        ok, msg = pin_session_model(cfg, st, target, want, dry_run=dry_run)
+        st.log(f"[model] [{target[:30]}] 原模型 {s.get('model') or '?'} → "
+               f"{'会钉回' if dry_run else ('已钉回' if ok else '没成功')}（{msg}）")
+        if not ok and not dry_run:
+            # 第一次失败就收手：多半是锁屏/下拉点不动，继续只会把界面切来切去
+            st.log(f"[model] 钉不动（{msg}）→ 停止后续切换，剩下的等解锁后再跑")
+            break
+        ok_n += 1 if ok else 0
+    return (0 if ok_n == len(off) else 1), f"{ok_n}/{len(off)} 个会话已钉到 '{want}'"
+
+
+class ModelViolation(RuntimeError):
+    """发现当前不是在钉死的模型上，而且切不回来 → 立刻停下整条链。
+
+    按用户要求：只认一个模型；检测到别的模型先尝试切回来，切不动就直接停，
+    不再「这一轮跳过、下一轮再看看」——那等于让额度继续烧到别的桶里。
+    """
+
+
 def model_guard(cfg: dict, st: State, agent_id: str, *, auto: bool | None = None) -> tuple[bool | None, str]:
     """确认当前对话还是「钉死」的那个模型；不是就尝试切回去。
 
@@ -2527,6 +2868,15 @@ def cmd_model(a) -> int:
     spec = agentlib.find_agent(cfg, getattr(a, "agent", None)) or agentlib.agent_specs(cfg)[0]
     acfg = agentlib.agent_view(cfg, spec, st)
     want = (a.want or (acfg.get("model") or {}).get("want") or "").strip()
+    if getattr(a, "pin_sessions", False):
+        # 模型是跟会话走的：界面上那个按钮只代表当前打开的那个对话，
+        # 后台被投喂的会话可能一直跑在 auto/ 上 —— 这里按会话库逐个钉回去。
+        if not want:
+            print("要用 --pin-sessions 得先配 model.want 或给 --want（例如 --want zcode2api）")
+            return 2
+        code, summary = pin_offpin_sessions(acfg, st, want, dry_run=a.dry_run)
+        print(summary)                      # 每个会话的明细已经由 st.log 打出来了
+        return code
     cur = probe_model(acfg)
     print(f"{spec['id']}: {cur or '(读不到模型按钮)'}")
     if a.set:
@@ -2548,6 +2898,41 @@ def cmd_model(a) -> int:
     if want:
         print(f"✓ 模型符合预期（含 '{want}'）")
     agentlib.update_state(st, spec["id"], last_model=cur)
+    return 0
+
+
+def cmd_queue(a) -> int:
+    """看/清任务队列：run 开着 queue 就会按队列逐条派活（不再喂 continue）。"""
+    cfg = load_config(a.config)
+    st = State(cfg)
+    q = queue_conf(cfg)
+    tasks = queue_tasks(cfg)
+    done = queue_load_done(st)
+    if a.reset:
+        queue_save_done(st, {})
+        done = {}
+        print(f"已清空队列进度（{len(tasks)} 条重新可派）")
+    if a.reset_id:
+        done.pop(a.reset_id, None)
+        queue_save_done(st, done)
+        print(f"已重置任务 {a.reset_id}")
+    if not q.get("enabled"):
+        print("队列未开启：config 里写 queue.enabled=true、queue.path=<queue_fx.json>")
+    print(f"队列: {queue_path(cfg) or '（未配置）'}")
+    print(f"任务 {len(tasks)} 条，已派 {len(done)} 条，剩余 {max(0, len(tasks) - len(done))} 条")
+    nxt = queue_next(cfg, st)
+    if a.next and nxt:
+        print(f"\n下一条: {nxt['id']}（{nxt.get('group', '')}）")
+        print("任务书会写到 bridge/tasks/，实际投喂的指令是：")
+        print("  " + queue_prompt(cfg, st, nxt))
+        print("\n任务书内容：")
+        print("\n".join(("  " + ln) for ln in str(nxt.get("prompt") or "").splitlines()))
+    elif a.next:
+        print("没有可派的任务（队列空/读不到/已全部派过）")
+    if a.list:
+        for t in tasks[:a.list]:
+            flag = "✓" if str(t["id"]) in done else " "
+            print(f"  [{flag}] {t['id']:<32} {t.get('group', '')}")
     return 0
 
 
@@ -2609,6 +2994,13 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("sessions", help="列出侧栏对话（确定要盯哪个）")
     p.add_argument("--agent", default=None, help="看哪个 agent 的窗口（默认 worker）")
     p.set_defaults(func=cmd_sessions)
+
+    p = sub.add_parser("queue", help="看/清任务队列（run 按队列派活，避免跑题）")
+    p.add_argument("--next", action="store_true", help="显示下一条任务和它会投喂什么")
+    p.add_argument("--list", type=int, default=0, help="列出前 N 条（带是否已派）")
+    p.add_argument("--reset", action="store_true", help="清空派活进度")
+    p.add_argument("--reset-id", default="", help="只重置某一条任务")
+    p.set_defaults(func=cmd_queue)
 
     p = sub.add_parser("target", help="看/改监控名单")
     p.add_argument("--agent", default=None, help="改哪个 agent（默认 worker）")
@@ -2707,6 +3099,9 @@ def main(argv: list[str] | None = None) -> int:
     mp.add_argument("--agent", default=None, help="目标 agent（默认 worker）")
     mp.add_argument("--want", default=None, help="期望模型名里包含的字样（如 zcode2api）")
     mp.add_argument("--set", action="store_true", help="尝试切换（需要解锁桌面）")
+    mp.add_argument("--pin-sessions", action="store_true",
+                    help="把被监控会话里跑在 auto/ 等别的模型上的逐个切过去钉回 want")
+    mp.add_argument("--dry-run", action="store_true", help="配合 --pin-sessions 只看会动哪几个会话")
     mp.set_defaults(func=cmd_model)
 
     rp = sub.add_parser("restart-app", help="带无障碍开关重启目标应用（修 a11y 树为空）")

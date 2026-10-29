@@ -55,7 +55,9 @@ DEFAULT_NEW_CHAT = {
 DEFAULT_MODEL = {
     "want": "",            # 名字里要包含的字样，例如 "zcode2api"；空=不校验
     "auto_pin": True,      # 发现没钉死就尝试切回去（需要解锁桌面能点下拉）
-    "enforce": True,       # 切不回去时宁可这一轮不投喂，也别把额度烧在别的模型上
+    "enforce": True,       # 只认这一个模型
+    # 发现别的模型时怎么办：stop=先尝试切回，切不动就停止整条链（默认）｜skip=跳过这一轮
+    "on_mismatch": "stop",
     "check_every": 10,     # 每 N 轮复检一次，防中途漂移
 }
 

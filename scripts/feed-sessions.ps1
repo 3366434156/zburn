@@ -35,6 +35,9 @@ param(
     # 「没打开任何对话」的状态，树里根本没有 Edit —— 这时会被误判成
     # 「无障碍树被禁用」，然后反复重启应用（越修越糟）。
     [switch]$OpenOnly,
+    # 切到 Targets 里的第一条对话就退出，不投喂、**不回退到别的对话**。
+    # 用途：模型是跟会话走的，钉模型必须先把目标会话切到前台（model --pin-sessions）。
+    [switch]$SwitchOnly,
     [int]$MaxDepth = 40
 )
 $ErrorActionPreference = 'Stop'
@@ -330,12 +333,34 @@ if ($DryRun) {
     foreach ($t in $tasks) { Write-Output ("  - {0}  ({1},{2} {3}x{4})" -f $t.Name, [int]$t.X, [int]$t.Y, [int]$t.W, [int]$t.H) }
     exit 0
 }
-if (-not $Prompt -and -not $OpenOnly) {
+if (-not $Prompt -and -not $OpenOnly -and -not $SwitchOnly) {
     [Console]::Error.WriteLine('没有 -Prompt：真要投喂必须给指令（只扫描请加 -DryRun）')
     exit 3
 }
 
 $done = 0; $skipped = 0; $failed = 0
+
+if ($SwitchOnly) {
+    # 只认 Targets 里那一条：切不过去就失败，绝不回退到别的对话
+    # （回退会把别人的对话切到前台，然后 model --pin-sessions 会钉错对象）。
+    if (-not $rawTargets -or $rawTargets.Count -eq 0) {
+        [Console]::Error.WriteLine('-SwitchOnly 必须给 -Targets（要切到哪个对话）'); exit 3
+    }
+    $t = $tasks | Select-Object -First 1
+    if (-not $t) { [Console]::Error.WriteLine('侧栏里没找到目标对话'); exit 3 }
+    $label = $t.Name.Substring(0, [Math]::Min(26, $t.Name.Length))
+    $sw = Switch-Session $t
+    if (-not $sw.Ok) { [Console]::Error.WriteLine(("切换失败：[{0}] {1}" -f $label, $sw.Err)); exit 2 }
+    # 输入框就绪 = 界面真的换成这个对话了（切完立刻读模型按钮才靠谱）
+    $composer = $null
+    for ($w = 0; $w -lt 10 -and -not $composer; $w++) {
+        Start-Sleep -Milliseconds 800
+        $composer = Find-Composer (Get-Controls)
+    }
+    if (-not $composer) { [Console]::Error.WriteLine(("切到 [{0}] 后 10 秒没等到输入框" -f $label)); exit 2 }
+    Write-Output ("已切到对话 [{0}]" -f $label)
+    exit 0
+}
 
 if ($OpenOnly) {
     # 重启/冷启动后应用常停在「没打开任何对话」的空白状态：侧栏可能还没渲染，

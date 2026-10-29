@@ -230,32 +230,40 @@ def context(cfg: dict, targets: list[str] | None = None,
         con.close()
 
 
-def _latest_context(con: sqlite3.Connection, sid: str) -> int:
-    """会话当前的上下文 token 数 = 最近一次非零 input_tokens 的模型请求。
+def _latest_usage(con: sqlite3.Connection, sid: str) -> tuple[int, str]:
+    """会话当前的 (上下文 token, 实际用的模型) = 最近一次非零 input_tokens 的模型请求。
 
     model_usage 每行是一次模型请求，input_tokens 就是那次发过去的完整上下文，
     和 UI「上下文容量」显示的是同一个数（已实测对上）；turn_usage 是一整轮
     多次请求的累计，不能拿来当上下文。取「最近一条非零」是因为失败/取消的
     请求记 0，不代表会话真的空了。
+
+    模型也读这同一行：ZCode 的模型选择是**跟会话走**的，新对话默认落到
+    `auto/...`（网关自己挑桶），只读界面上当前打开那个对话的模型按钮
+    会把「后台会话在 auto 上烧额度」完全漏掉。
     """
     try:
         row = con.execute(
-            "select input_tokens from model_usage "
+            "select input_tokens, model_id from model_usage "
             "where session_id=? and input_tokens>0 order by started_at desc limit 1",
             (sid,)).fetchone()
     except Exception:
-        return 0
-    return int(row["input_tokens"]) if row else 0
+        return 0, ""
+    if not row:
+        return 0, ""
+    return int(row["input_tokens"] or 0), str(row["model_id"] or "")
 
 
 def session_contexts(cfg: dict, *, targets: list[str] | None = None,
-                     session_regex: str = "") -> list[dict] | None:
-    """被监控会话的当前上下文（token），按最近更新排序；返回 None = 会话库不可用。
+                     session_regex: str = "", union: bool = False) -> list[dict] | None:
+    """被监控会话的当前上下文（token）/实际模型，按最近更新排序；None = 会话库不可用。
 
     匹配规则与投喂一致：targets（标题，宽松前后缀 + 标题#序号）优先，
-    其次 session_regex（对完整标题匹配）。名单一条都没对上 / 库打不开 /
-    没配置筛选时返回 None —— 调用方要把压缩闸门当「失明」处理：
-    继续原投喂流程，绝不能因为读不到上下文就停喂。
+    其次 session_regex（对完整标题匹配）。union=True 时两者取并集 ——
+    钉模型时要把「以后可能被喂到的会话」都算上，而投喂只认名单。
+
+    名单一条都没对上 / 库打不开 / 没配置筛选时返回 None —— 调用方要把闸门当
+    「失明」处理：继续原投喂流程，绝不能因为读不到上下文就停喂。
     """
     db = (cfg.get("uia") or {}).get("session_db")
     if db is None or str(db).strip().lower() in ("-", "none", "off", "disabled"):
@@ -295,7 +303,7 @@ def session_contexts(cfg: dict, *, targets: list[str] | None = None,
                     wanted.append(r)
         if wanted:
             pass
-        elif any((t or "").strip() for t in (targets or [])):
+        elif any((t or "").strip() for t in (targets or [])) and not union:
             # 名单一条都没对上：闸门失明，不回退正则（和投喂「名单优先」的行为一致）
             return None
         elif session_regex:
@@ -306,14 +314,24 @@ def session_contexts(cfg: dict, *, targets: list[str] | None = None,
             wanted = [r for r in rows if rx.search(r.get("title", ""))]
         else:
             return None
+        if union and session_regex:
+            try:
+                rx = re.compile(session_regex)
+                have = {r["id"] for r in wanted}
+                wanted += [r for r in rows
+                           if r["id"] not in have and rx.search(r.get("title", ""))]
+            except re.error:
+                pass
         out = []
         for r in wanted:
+            tokens, model = _latest_usage(con, r["id"])
             out.append({
                 "id": r["id"],
                 "title": r.get("title") or "",
                 # 按哪条名单条目匹配上的（保留「标题#序号」写法）；正则命中的就是标题本身
                 "matched": r.get("matched") or (r.get("title") or ""),
-                "context_tokens": _latest_context(con, r["id"]),
+                "context_tokens": tokens,
+                "model": model,
                 "compacting": bool(r.get("time_compacting")),
                 "updated": r.get("time_updated"),
             })

@@ -113,13 +113,29 @@ def test_model_guard_repins_when_unlocked(tmp_path, monkeypatch):
     assert ok is True and "钉回" in msg
 
 
-def test_worker_skips_feed_when_model_wrong(tmp_path, monkeypatch):
-    """模型没钉住时宁可这一轮空着，也不要把额度烧在别的模型上。"""
+def test_worker_stops_when_model_wrong(tmp_path, monkeypatch):
+    """只认一个模型：模型不对就先尝试切回，切不回来 → 抛 ModelViolation 停整条链。"""
     st = _fake_state(tmp_path)
     cfg = {
         "paths": {"state_dir": str(tmp_path)},
         "app": {"process_name": "ZCode"}, "uia": {}, "feed": {}, "prompt": {},
         "agents": [{"id": "zcode", "role": "worker", "model": {"want": "zcode2api"}}],
+    }
+    monkeypatch.setattr(zburn, "app_running", lambda cfg: True)
+    monkeypatch.setattr(zburn, "uia_ok", lambda cfg: (True, "ok"))
+    monkeypatch.setattr(zburn, "model_guard", lambda *a, **kw: (False, "未钉住（magpie/auto/GLM）"))
+    with pytest.raises(zburn.ModelViolation):
+        zburn.run_agent_once(cfg, st, agents.agent_specs(cfg)[0], 1, None)
+
+
+def test_worker_can_skip_instead_of_stopping(tmp_path, monkeypatch):
+    """想保留旧行为就把 model.on_mismatch 改成 skip。"""
+    st = _fake_state(tmp_path)
+    cfg = {
+        "paths": {"state_dir": str(tmp_path)},
+        "app": {"process_name": "ZCode"}, "uia": {}, "feed": {}, "prompt": {},
+        "agents": [{"id": "zcode", "role": "worker",
+                    "model": {"want": "zcode2api", "on_mismatch": "skip"}}],
     }
     monkeypatch.setattr(zburn, "app_running", lambda cfg: True)
     monkeypatch.setattr(zburn, "uia_ok", lambda cfg: (True, "ok"))
